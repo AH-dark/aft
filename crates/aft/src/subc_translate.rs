@@ -247,7 +247,10 @@ pub(crate) fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(),
     Ok(())
 }
 
-fn normalize_path_arguments(bare_name: &str, args: Value) -> Result<Value, TranslateError> {
+pub(crate) fn normalize_path_arguments(
+    bare_name: &str,
+    args: Value,
+) -> Result<Value, TranslateError> {
     let mut map = match args {
         Value::Object(map) => map,
         _ => return Err(invalid_request("tool arguments must be an object")),

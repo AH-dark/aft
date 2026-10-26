@@ -3602,6 +3602,10 @@ impl BgTaskRegistry {
 
     pub fn has_erased_watch_reference(&self, task_id: &str) -> bool {
         self.evaluate_erased_watch_targets();
+        self.observed_erased_watch_reference(task_id)
+    }
+
+    pub(crate) fn observed_erased_watch_reference(&self, task_id: &str) -> bool {
         // A task this registry still runs is not erased whatever its row
         // state: its output is still captured and its watches still scan, so
         // reporting it as a terminal storage failure would be false.
@@ -7418,6 +7422,81 @@ impl BgTaskRegistry {
         validate_task_id(task_id).ok()?;
         let task = self.task_for_session(task_id, session_id)?;
         Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
+    }
+
+    /// Read existing task facts and output without adopting, polling, renewing,
+    /// acknowledging, or populating output caches. If the task is not already
+    /// registered, read its session's persisted bundle without starting recovery
+    /// and its watchdog.
+    pub(crate) fn observation_status(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: Option<&Path>,
+        storage_dir: &Path,
+        preview_bytes: usize,
+    ) -> Option<(BgTaskSnapshot, TaskPaths)> {
+        validate_task_id(task_id).ok()?;
+        if let Some(task) = self.task_for_session(task_id, session_id) {
+            let state = task.lock_state().ok()?;
+            let mut snapshot = task.snapshot_locked(&state, preview_bytes);
+            if snapshot.output_preview.is_empty() && state.metadata.mode == BgMode::Pipes {
+                (snapshot.output_preview, snapshot.output_truncated) =
+                    state.buffer.read_tail(preview_bytes);
+            }
+            return Some((snapshot, task.paths.clone()));
+        }
+        let resolved =
+            resolve_task_layout(&session_tasks_dir(storage_dir, session_id), task_id).ok()?;
+        let mut metadata = read_task_at(&resolved).ok()?;
+        if metadata.session_id != session_id
+            || metadata.task_id != task_id
+            || project_root.is_some_and(|root| {
+                metadata.project_root.as_deref().map(canonicalized_path)
+                    != Some(canonicalized_path(root))
+            })
+        {
+            return None;
+        }
+        if !metadata.is_terminal() {
+            if let Some(marker) = read_exit_marker(&resolved.paths).ok().flatten() {
+                metadata = terminal_metadata_from_marker(metadata, marker, None);
+            }
+        }
+        let elapsed_ms =
+            (!metadata.is_terminal()).then(|| unix_millis().saturating_sub(metadata.started_at));
+        let buffer = BgBuffer::registered(&resolved.paths, metadata.mode.clone());
+        let row = metadata.to_bash_task_row("", &resolved.paths).ok()?;
+        let mut snapshot = terminal_db_row_snapshot(row, metadata);
+        if snapshot.info.mode == BgMode::Pipes {
+            (snapshot.output_preview, snapshot.output_truncated) = buffer.read_tail(preview_bytes);
+        }
+        snapshot.elapsed_ms = elapsed_ms;
+        Some((snapshot, resolved.paths))
+    }
+
+    pub(crate) fn observation_artifact_page_until(
+        &self,
+        paths: TaskPaths,
+        artifact: TaskArtifact,
+        offset: u64,
+        deadline: Instant,
+    ) -> std::io::Result<ArtifactPage> {
+        let dir = paths.dir.clone();
+        crate::bounded_io::run(&dir, Some(deadline), move |_| {
+            let (mut file, len) = super::persistence::sample_task_artifact(&paths, artifact)?;
+            let start = offset.min(len);
+            let requested = len.saturating_sub(start).min(ARTIFACT_PAGE_BYTES as u64);
+            let bytes = file.read_range(start, requested)?;
+            let next_offset = start + bytes.len() as u64;
+            let has_more =
+                bytes.len() as u64 == requested && !bytes.is_empty() && next_offset < len;
+            Ok(ArtifactPage {
+                bytes,
+                next_offset,
+                has_more,
+            })
+        })
     }
 
     /// Explain failed adoption without importing a task from another namespace.

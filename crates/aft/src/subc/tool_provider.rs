@@ -569,7 +569,7 @@ pub(super) fn catalog_for_request(
         powershell_available,
         (runon, revision_reads),
         worker_wait_max_ms,
-        false,
+        CatalogRestrictions::default(),
     )
 }
 
@@ -589,7 +589,32 @@ pub(super) fn catalog_for_confined_request(
         powershell_available,
         (runon, revision_reads),
         worker_wait_max_ms,
-        true,
+        CatalogRestrictions {
+            confined: true,
+            rich_ui: false,
+        },
+    )
+}
+
+pub(super) fn catalog_for_rich_ui_request(
+    request: CatalogRequest,
+    preset: CatalogPreset,
+    disabled: &[String],
+    revision_reads: bool,
+    worker_wait_max_ms: u64,
+    confined: bool,
+) -> Result<Value, ErrorBody> {
+    render_catalog(
+        request,
+        preset,
+        disabled,
+        false,
+        (false, revision_reads),
+        worker_wait_max_ms,
+        CatalogRestrictions {
+            confined,
+            rich_ui: true,
+        },
     )
 }
 
@@ -894,6 +919,12 @@ fn rename_served_tools(text: &str, served: &[String]) -> String {
     out
 }
 
+#[derive(Default)]
+struct CatalogRestrictions {
+    confined: bool,
+    rich_ui: bool,
+}
+
 /// `offers` is the session's (`runon`, `revision_reads`) pair: which
 /// enabled-only arguments its catalog carries.
 fn render_catalog(
@@ -903,7 +934,7 @@ fn render_catalog(
     powershell_available: bool,
     offers: (bool, bool),
     worker_wait_max_ms: u64,
-    confined: bool,
+    restrictions: CatalogRestrictions,
 ) -> Result<Value, ErrorBody> {
     #[cfg(test)]
     CATALOG_RENDERS.set(CATALOG_RENDERS.get() + 1);
@@ -918,10 +949,38 @@ fn render_catalog(
     if request.preset.is_none() {
         answer = answer.with_presets(CatalogPreset::ALL.map(CatalogPreset::name));
     }
-    if confined {
+    if restrictions.rich_ui {
+        // Head catalogs normally omit the worker-only watch tool. A UI may
+        // observe an existing task without gaining permission to start one.
+        if preset == CatalogPreset::Head {
+            answer.tools.extend(
+                tools_for_session(
+                    CatalogPreset::Worker,
+                    disabled,
+                    false,
+                    false,
+                    revision_reads,
+                )
+                .into_iter()
+                .filter(|tool| tool.name == "bash_watch"),
+            );
+        }
         answer
             .tools
-            .retain(|tool| matches!(tool.name.as_str(), "read" | "grep" | "glob" | "outline"));
+            .retain(|tool| super::carrier_read_only::allowed(&tool.name));
+        for tool in &mut answer.tools {
+            if let Some(canonical) = crate::tool_gate::canonical_tool_name(&tool.name) {
+                tool.name = canonical.into();
+            }
+        }
+    }
+    if restrictions.confined {
+        answer.tools.retain(|tool| {
+            matches!(
+                tool.name.as_str(),
+                "read" | "grep" | "glob" | "outline" | "aft_outline"
+            )
+        });
         for tool in &mut answer.tools {
             if tool.name == "outline" {
                 tool.name = "aft_outline".into();
@@ -1211,6 +1270,7 @@ pub(super) fn admission_trusted(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
 ) -> bool {
     !matches!(identity.trust, super::BindTrust::Untrusted)
+        || super::carrier_read_only::observes_tasks(identity, &call.name)
         || (call.call_key.is_some()
             && identity.consumer_elicitation_capable
             && matches!(call.name.as_str(), "bash" | "powershell"))
@@ -5000,7 +5060,7 @@ mod route_tests {
         let (writer, mut replies) = mpsc::channel(8);
         let (bash_tx, _bash_rx) = mpsc::channel(8);
         let (touch_tx, _touch_rx) = mpsc::channel(8);
-        let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+        let (deferred_tx, mut deferred_rx) = mpsc::unbounded_channel();
         let deferred_tx = super::super::DeferredResponseSender {
             entries: deferred_tx,
             wake: crate::response_finalize::DeferredResponseWake::default(),
@@ -5040,10 +5100,30 @@ mod route_tests {
         )
         .await
         .unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(3), replies.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let mut reply = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                reply = replies.recv() => reply.unwrap(),
+                entry = deferred_rx.recv() => {
+                    let mut entry = entry.expect("deferred tool setup");
+                    let ctx = executor.actor_context(&entry.root).unwrap();
+                    let response = loop {
+                        if let Some(response) = (entry.pending.poll)(&ctx) {
+                            break response;
+                        }
+                        deferred_tx.wake.notified().await;
+                    };
+                    deliver_resolved_subc_response(
+                        &writer, ResolvedSubcResponse { entry, response }, routes,
+                        &mut HashMap::new(), executor, &Arc::default(),
+                        &Arc::new(Notify::new()), metrics, 1024 * 1024,
+                    ).await.unwrap();
+                    replies.recv().await.unwrap()
+                }
+            }
+        })
+        .await
+        .unwrap();
+        reply.project_tool_result().unwrap();
         assert!(matches!(
             reply.header.ty,
             FrameType::Response | FrameType::Error | FrameType::StreamEnd
@@ -5054,6 +5134,745 @@ mod route_tests {
                 .is_err()
         );
         reply
+    }
+
+    fn occipital_identity(root: &ProjectRootId, role: RouteRole) -> RouteIdentity {
+        let mut identity = test_support::route_identity(root, "session-s");
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.role = role;
+        data.trust = BindTrust::Untrusted;
+        data.scope = Some(stamp("worker"));
+        data.spawn_principal = AuthenticatedPrincipal::RouteBind {
+            trust: crate::sandbox_spawn::PrincipalTrust::Untrusted,
+            route_channel: 41,
+            route_epoch: 1,
+            project_root: root.as_path().into(),
+            harness: data.harness.clone(),
+            session_id: data.session.clone(),
+            principal_id: Some("reserved:occipital".into()),
+        };
+        identity
+    }
+
+    #[tokio::test]
+    async fn occipital_refuses_unlisted_tools_before_dispatch() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let (_dir, root) = test_support::test_root("occipital-denied");
+        let mut names: Vec<_> = METADATA
+            .iter()
+            .map(|(name, _, _)| *name)
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "read"
+                        | "grep"
+                        | "glob"
+                        | "bash_status"
+                        | "outline"
+                        | "zoom"
+                        | "search"
+                        | "callgraph"
+                )
+            })
+            .collect();
+        names.extend([
+            "aft_inspect",
+            "aft_delete",
+            "aft_move",
+            "aft_import",
+            "aft_safety",
+            "future_tool",
+            "configure",
+            "grants.revoke",
+            "call.withdraw",
+        ]);
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            for name in &names {
+                let identity = occipital_identity(&root, role);
+                let reply = exchange_with_actor(
+                    json!({"name": name, "preset": "worker", "arguments": {}}),
+                    identity,
+                    test_support::test_ctx(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    |request, _| {
+                        ACTIONS.fetch_add(1, Ordering::SeqCst);
+                        Response::success(request.id, json!({}))
+                    },
+                )
+                .await;
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(reply.header.ty, FrameType::Error, "{name}: {body}");
+                assert_eq!(body["code"], "carrier_read_only", "{name}: {body}");
+                assert_eq!(
+                    body["message"],
+                    format!(
+                        "This route is read-only: {name} is not available to the rich-UI provider."
+                    )
+                );
+                assert_eq!(ACTIONS.load(Ordering::SeqCst), 0, "{name} dispatched");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_allowed_reads_keep_session_authority() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_dir, root) = test_support::test_root("occipital-allowed");
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            for (name, arguments, internal) in [
+                ("read", json!({"path":"main.rs"}), "read"),
+                ("aft_outline", json!({"target":"main.rs"}), "outline"),
+                (
+                    "aft_zoom",
+                    json!({"batch":[{"target":"main.rs","symbols":"main"}]}),
+                    "zoom",
+                ),
+                ("aft_search", json!({"query":"main"}), "semantic_search"),
+                ("grep", json!({"pattern":"main"}), "grep"),
+                ("glob", json!({"pattern":"*.rs"}), "glob"),
+                (
+                    "aft_callgraph",
+                    json!({"path":"main.rs","symbol":"main","op":"callers"}),
+                    "callers",
+                ),
+            ] {
+                *LAST_DISPATCH.lock().unwrap() = None;
+                let identity = occipital_identity(&root, role);
+                let reply = exchange_with_actor(
+                    json!({"name":name,"preset":"worker","arguments":arguments}),
+                    identity,
+                    test_support::test_ctx(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    |request, _| {
+                        assert!(matches!(
+                            crate::access_policy::current_ask_route(),
+                            crate::access_policy::AskRoute::Deny
+                        ));
+                        *LAST_DISPATCH.lock().unwrap() = Some(json!({
+                            "command":request.command, "session":request.session(),
+                        }));
+                        Response::success(request.id, json!({"marker":"session-read"}))
+                    },
+                )
+                .await;
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+                assert_eq!(body["isError"], false, "{name}: {body}");
+                assert_eq!(
+                    *LAST_DISPATCH.lock().unwrap(),
+                    Some(json!({"command":internal,"session":"session-s"})),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_refuses_future_tools_by_default() {
+        let (_dir, root) = test_support::test_root("occipital-future-tool");
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            let reply = exchange_with_actor(
+                json!({"name":"future_tool","preset":"worker","arguments":{}}),
+                occipital_identity(&root, role),
+                test_support::test_ctx(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("unknown tools must not dispatch"),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error, "{body}");
+            assert_eq!(body["code"], "carrier_read_only", "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_tool_refusal_precedes_target_refusal_for_both_result_bodies() {
+        let (_dir, root) = test_support::test_root("occipital-refusal-order");
+        for tool_result_body in [false, true] {
+            for name in ["write", "future_tool"] {
+                for target in ["https://example.com/doc", "issue://123", "pr://123"] {
+                    let mut identity = occipital_identity(&root, RouteRole::ToolProviderV1);
+                    Arc::get_mut(&mut identity.0).unwrap().tool_result_body = tool_result_body;
+                    let reply = exchange_with_actor(
+                        json!({"name":name,"preset":"worker","arguments":{"path":target,"content":"never written"}}),
+                        identity, test_support::test_ctx(), &Arc::new(DispatchPathMetrics::new()),
+                        |_, _| panic!("forbidden tool must not dispatch"),
+                    ).await;
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                    assert_eq!(reply.header.ty, FrameType::Error, "{body}");
+                    assert_eq!(body["code"], "carrier_read_only", "{body}");
+                    assert_eq!(body["message"], format!("This route is read-only: {name} is not available to the rich-UI provider."));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_allowed_read_preserves_negotiated_tool_result_body() {
+        let (_dir, root) = test_support::test_root("occipital-tool-result");
+        let mut identity = occipital_identity(&root, RouteRole::ToolProviderV1);
+        Arc::get_mut(&mut identity.0).unwrap().tool_result_body = true;
+        let reply = exchange_with_actor(
+            json!({"name":"read","preset":"worker","arguments":{"path":"local.txt"}}),
+            identity,
+            test_support::test_ctx(),
+            &Arc::new(DispatchPathMetrics::new()),
+            |request, _| Response::success(request.id, json!({"content":"read-marker"})),
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: cortexkit_role_tool_provider::result::ToolResult =
+            serde_json::from_slice(&reply.body).unwrap();
+        cortexkit_role_tool_provider::result::validate(&body).unwrap();
+        assert!(body.error_code.is_none(), "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn occipital_refuses_management_operations_and_spoofed_identity() {
+        let (_dir, root) = test_support::test_root("occipital-operations");
+        for operation in [
+            "grants.revoke",
+            "grants.list",
+            "call.withdraw",
+            "call.pull",
+            "configure",
+            "health.digest",
+            "bg_events",
+            "future.operation",
+        ] {
+            let reply = exchange_with_actor(
+                json!({"op":operation,"principal":"reserved:broca","params":{}}),
+                occipital_identity(&root, RouteRole::ToolProviderV1),
+                test_support::test_ctx(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("refused operation must not dispatch"),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error, "{operation}: {body}");
+            assert_eq!(body["code"], "carrier_read_only", "{operation}: {body}");
+        }
+    }
+
+    async fn occipital_network_target_case(name: &str, target: &str, kind: &str) {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let (_dir, root) = test_support::test_root("occipital-network-target");
+        let arguments = match name {
+            "read" => json!({"path": target}),
+            "aft_outline" => json!({"target": target}),
+            "aft_zoom" => json!({"batch":[{"target":target,"symbols":"Overview"}]}),
+            _ => panic!("unexpected target-bearing tool"),
+        };
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                occipital_identity(&root, role),
+                test_support::test_ctx(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, _| {
+                    ACTIONS.fetch_add(1, Ordering::SeqCst);
+                    Response::success(request.id, json!({}))
+                },
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error, "{name} {target}: {body}");
+            assert_eq!(body["code"], "carrier_read_only", "{body}");
+            assert_eq!(body["message"], format!("This route is read-only: {kind} targets are not available to the rich-UI provider."));
+            assert_eq!(
+                ACTIONS.load(Ordering::SeqCst),
+                0,
+                "network target dispatched"
+            );
+        }
+    }
+
+    macro_rules! network_target_test {
+        ($test:ident, $tool:literal, $target:literal, $kind:literal) => {
+            #[tokio::test]
+            async fn $test() {
+                occipital_network_target_case($tool, $target, $kind).await;
+            }
+        };
+    }
+
+    network_target_test!(
+        occipital_denies_read_issue_target,
+        "read",
+        "issue://123",
+        "issue://"
+    );
+    network_target_test!(occipital_denies_read_pr_target, "read", "pr://123", "pr://");
+    network_target_test!(
+        occipital_denies_outline_http_target,
+        "aft_outline",
+        "http://example.com/doc",
+        "URL"
+    );
+    network_target_test!(
+        occipital_denies_outline_https_target,
+        "aft_outline",
+        "https://example.com/doc",
+        "URL"
+    );
+    network_target_test!(
+        occipital_denies_outline_issue_target,
+        "aft_outline",
+        "issue://123",
+        "issue://"
+    );
+    network_target_test!(
+        occipital_denies_outline_pr_target,
+        "aft_outline",
+        "pr://123",
+        "pr://"
+    );
+    network_target_test!(
+        occipital_denies_zoom_http_target,
+        "aft_zoom",
+        "http://example.com/doc",
+        "URL"
+    );
+    network_target_test!(
+        occipital_denies_zoom_https_target,
+        "aft_zoom",
+        "https://example.com/doc",
+        "URL"
+    );
+    network_target_test!(
+        occipital_denies_zoom_issue_target,
+        "aft_zoom",
+        "issue://123",
+        "issue://"
+    );
+    network_target_test!(
+        occipital_denies_zoom_pr_target,
+        "aft_zoom",
+        "pr://123",
+        "pr://"
+    );
+
+    #[tokio::test]
+    async fn occipital_network_target_aliases_cannot_bypass_admission() {
+        let (_dir, root) = test_support::test_root("occipital-target-aliases");
+        for (name, arguments) in [
+            ("read", json!({"path":"issue://123"})),
+            ("outline", json!({"target":["local.rs", "pr://123"]})),
+            (
+                "zoom",
+                json!({"path":"http://example.com/doc","symbol":"Overview"}),
+            ),
+            (
+                "zoom",
+                json!({"url":"https://example.com/doc","symbols":"Overview"}),
+            ),
+            ("zoom", json!({"path":"pr://123","symbol":"1"})),
+            (
+                "zoom",
+                json!({"targets":[{"url":"https://example.com/doc","symbol":"Overview"}]}),
+            ),
+            (
+                "zoom",
+                json!({"targets":{"path":"issue://123","symbol":"1"}}),
+            ),
+            (
+                "zoom",
+                json!({"batch":"[{\"target\":\"https://example.com/doc\",\"symbols\":\"Overview\"}]"}),
+            ),
+            (
+                "zoom",
+                json!({"batch":[{"target":"local.rs","symbols":"main"},{"url":"pr://123","symbols":"1"}]}),
+            ),
+        ] {
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                occipital_identity(&root, RouteRole::Legacy),
+                test_support::test_ctx(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("remote target alias must not dispatch"),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Error, "{name}: {body}");
+            assert_eq!(body["code"], "carrier_read_only", "{name}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_target_restrictions_do_not_affect_normal_routes() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let (_dir, root) = test_support::test_root("normal-network-target");
+        for (name, targets) in [
+            ("read", vec!["issue://123", "pr://123"]),
+            (
+                "outline",
+                vec![
+                    "http://example.com/doc",
+                    "https://example.com/doc",
+                    "issue://123",
+                    "pr://123",
+                ],
+            ),
+            (
+                "zoom",
+                vec![
+                    "http://example.com/doc",
+                    "https://example.com/doc",
+                    "issue://123",
+                    "pr://123",
+                ],
+            ),
+        ] {
+            for target in targets {
+                let arguments = match name {
+                    "read" => json!({"path": target}),
+                    "outline" => json!({"target": target}),
+                    _ => json!({"batch":[{"target":target,"symbols":"Overview"}]}),
+                };
+                let mut identity = test_support::route_identity(&root, "normal-session");
+                Arc::get_mut(&mut identity.0).unwrap().role = RouteRole::ToolProviderV1;
+                let reply = exchange_with_actor(
+                    json!({"name":name,"preset":"worker","arguments":arguments}),
+                    identity,
+                    test_support::test_ctx(),
+                    &Arc::new(DispatchPathMetrics::new()),
+                    |request, _| {
+                        ACTIONS.fetch_add(1, Ordering::SeqCst);
+                        Response::success(request.id, json!({}))
+                    },
+                )
+                .await;
+                let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                assert_eq!(
+                    reply.header.ty,
+                    FrameType::Response,
+                    "{name} {target}: {body}"
+                );
+                assert_eq!(body["isError"], false, "{body}");
+            }
+        }
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn occipital_catalog_is_filtered_before_digest_and_system_text() {
+        let (_dir, root) = test_support::test_root("occipital-catalog");
+        let ctx = test_support::test_ctx();
+        for preset in ["head", "worker"] {
+            let identity = occipital_identity(&root, RouteRole::ToolProviderV1);
+            let reply = exchange_with_actor(
+                json!({"op":"tool.catalog","preset":preset,"system_text":{"preset":preset}}),
+                identity.clone(),
+                ctx.clone(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("catalog must not dispatch"),
+            )
+            .await;
+            let catalog: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{catalog}");
+            let names: std::collections::BTreeSet<_> = catalog["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect();
+            let expected: std::collections::BTreeSet<_> = [
+                "read",
+                "aft_outline",
+                "aft_zoom",
+                "aft_search",
+                "grep",
+                "glob",
+                "aft_callgraph",
+                "bash_status",
+                "bash_watch",
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(names, expected);
+            let text_names: std::collections::BTreeSet<_> = catalog["system_text"]["tool_names"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|name| name.as_str().unwrap())
+                .collect();
+            assert_eq!(text_names, expected);
+            let digest = remote_policy::catalog(
+                json!({"preset":preset,"system_text":{"preset":preset},"digest_only":true}),
+                &identity,
+                &ctx,
+            )
+            .unwrap();
+            assert_eq!(digest["catalog_digest"], catalog["catalog_digest"]);
+            let mut disabled = occipital_identity(&root, RouteRole::ToolProviderV1);
+            Arc::get_mut(&mut disabled.0).unwrap().disabled_tools = Arc::new(vec!["read".into()]);
+            let limited =
+                remote_policy::catalog(json!({"preset":preset}), &disabled, &ctx).unwrap();
+            assert!(!limited["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "read"));
+            assert_ne!(limited["catalog_digest"], catalog["catalog_digest"]);
+            assert!(remote_policy::catalog(
+                json!({"preset":preset,"params":{"mode":"full"}}),
+                &identity,
+                &ctx
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_caller_claim_does_not_restrict_other_principals() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let (_dir, root) = test_support::test_root("not-occipital");
+        let reply = exchange_with_actor(
+            json!({"name":"write", "preset":"worker", "arguments":{"path":"x","content":"x"}, "principal":"reserved:occipital"}),
+            test_support::route_identity(&root, "session-s"),
+            test_support::test_ctx(), &Arc::new(DispatchPathMetrics::new()),
+            |request, _| { ACTIONS.fetch_add(1, Ordering::SeqCst); Response::success(request.id, json!({})) },
+        ).await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn occipital_task_observation_is_limited_to_bound_session() {
+        use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+        use crate::bash_background::BgTaskStatus;
+
+        let (dir, root) = test_support::test_root("occipital-tasks");
+        let ctx = test_support::test_ctx();
+        let storage = dir.path().join("tasks");
+        for (session, id, output) in [
+            ("session-s", "bash-0123456789abcdef", "own-output-marker"),
+            (
+                "session-other",
+                "bash-fedcba9876543210",
+                "foreign-output-marker",
+            ),
+        ] {
+            let paths = task_paths(&storage, session, id).unwrap();
+            let mut metadata = PersistedTask::starting(
+                id.into(),
+                session.into(),
+                "echo output".into(),
+                root.as_path().into(),
+                Some(root.as_path().into()),
+                None,
+                false,
+                false,
+            );
+            metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            write_task(&paths.json, &metadata).unwrap();
+            std::fs::write(&paths.stdout, output).unwrap();
+            std::fs::write(&paths.stderr, "").unwrap();
+            std::fs::write(&paths.exit, "0\n").unwrap();
+            ctx.bash_background()
+                .replay_session(&storage, session)
+                .unwrap();
+        }
+        for role in [RouteRole::ToolProviderV1, RouteRole::Legacy] {
+            for name in ["bash_status", "bash_watch"] {
+                for (id, own) in [
+                    ("bash-0123456789abcdef", true),
+                    ("bash-fedcba9876543210", false),
+                ] {
+                    let identity = occipital_identity(&root, role);
+                    let reply = exchange_with_actor(
+                        json!({"name":name,"preset":"worker","arguments":{"taskId":id}}),
+                        identity,
+                        ctx.clone(),
+                        &Arc::new(DispatchPathMetrics::new()),
+                        |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+                    )
+                    .await;
+                    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+                    assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+                    let rendered = body.to_string();
+                    if own {
+                        assert_eq!(body["isError"], false, "{name}: {body}");
+                        assert!(rendered.contains("own-output-marker"), "{name}: {body}");
+                    } else {
+                        assert_eq!(body["isError"], true, "{name}: {body}");
+                        assert!(
+                            !rendered.contains("foreign-output-marker"),
+                            "{name}: {body}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn task_poll_identity(root: &ProjectRootId, session: &str, carrier: bool) -> RouteIdentity {
+        let mut identity = if carrier {
+            occipital_identity(root, RouteRole::ToolProviderV1)
+        } else {
+            test_support::route_identity(root, session)
+        };
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.role = RouteRole::ToolProviderV1;
+        data.scope = Some(stamp("worker"));
+        data.session = session.into();
+        if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal {
+            *session_id = session.into();
+        }
+        identity
+    }
+
+    async fn task_poll_deadline_case(name: &str) {
+        use crate::bash_background::persistence::read_task;
+        for carrier in [true, false] {
+            let (dir, ctx, task) =
+                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            ctx.update_config(|config| config.bash.worker_wait_max_ms = 3_600_000);
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let before = std::fs::read(&task.paths.json).unwrap();
+            let before_limit = read_task(&task.paths.json).unwrap().timeout_ms.unwrap();
+            let ctx = Arc::new(ctx);
+            let mut arguments = json!({"taskId":task.task_id});
+            if name == "bash_watch" {
+                arguments["timeoutMs"] = json!(1);
+            }
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                task_poll_identity(&root, &task.session_id, carrier),
+                ctx.clone(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+            assert_eq!(body["isError"], false, "{name}: {body}");
+            let after = read_task(&task.paths.json).unwrap();
+            let live_limit = ctx
+                .bash_background()
+                .hard_kill_deadline(&task.task_id, &task.session_id)
+                .unwrap()
+                .limit_ms;
+            if carrier {
+                assert_eq!(
+                    after.timeout_ms,
+                    Some(before_limit),
+                    "carrier {name} changed the persisted deadline"
+                );
+                assert_eq!(
+                    live_limit, before_limit,
+                    "carrier {name} changed the live deadline"
+                );
+                assert_eq!(
+                    std::fs::read(&task.paths.json).unwrap(),
+                    before,
+                    "carrier {name} rewrote task metadata"
+                );
+            } else {
+                assert!(
+                    after.timeout_ms.unwrap() > before_limit,
+                    "worker {name} did not persist its renewal"
+                );
+                assert!(live_limit > before_limit, "worker {name} did not renew");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_status_does_not_renew_but_worker_status_does() {
+        task_poll_deadline_case("bash_status").await;
+    }
+
+    #[tokio::test]
+    async fn occipital_watch_does_not_renew_but_worker_watch_does() {
+        task_poll_deadline_case("bash_watch").await;
+    }
+
+    #[tokio::test]
+    async fn occipital_watch_does_not_acknowledge_worker_completion() {
+        use crate::bash_background::{
+            persistence::{read_task, write_task},
+            BgTaskStatus,
+        };
+        for carrier in [true, false] {
+            let (dir, ctx, task) =
+                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            {
+                let mut state = task.lock_state().unwrap();
+                state
+                    .metadata
+                    .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+                state.metadata.completion_delivered = false;
+                write_task(&task.paths.json, &state.metadata).unwrap();
+            }
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let reply = exchange_with_actor(
+                json!({"name":"bash_watch","preset":"worker","arguments":{"taskId":task.task_id,"timeoutMs":1}}),
+                task_poll_identity(&root, &task.session_id, carrier), Arc::new(ctx),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("watch uses the deferred handler"),
+            ).await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body["isError"], false, "{body}");
+            assert_eq!(
+                read_task(&task.paths.json).unwrap().completion_delivered,
+                !carrier,
+                "only the worker's watch may acknowledge its completion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_cold_task_reads_do_not_register_or_rewrite_tasks() {
+        for name in ["bash_status", "bash_watch"] {
+            let (dir, original, task) =
+                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            std::fs::write(&task.paths.stdout, "observed-output-marker").unwrap();
+            std::fs::write(&task.paths.stderr, "").unwrap();
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                original.config().as_ref().clone(),
+            ));
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let before = std::fs::read(&task.paths.json).unwrap();
+            let mut arguments = json!({"taskId":task.task_id});
+            if name == "bash_watch" {
+                arguments["pattern"] = json!("observed-output-marker");
+                arguments["timeoutMs"] = json!(100);
+            }
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                task_poll_identity(&root, &task.session_id, true),
+                ctx.clone(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+            assert_eq!(body["isError"], false, "{name}: {body}");
+            if name == "bash_watch" {
+                assert!(
+                    body.to_string().contains("observed-output-marker"),
+                    "{name}: {body}"
+                );
+            } else {
+                assert!(body.to_string().contains("running"), "{name}: {body}");
+            }
+            assert!(
+                ctx.bash_background().task_for_test(&task.task_id).is_none(),
+                "carrier {name} registered the task and could re-arm its durable watches"
+            );
+            assert_eq!(
+                std::fs::read(&task.paths.json).unwrap(),
+                before,
+                "carrier {name} rewrote the task bundle"
+            );
+        }
     }
 
     #[tokio::test]

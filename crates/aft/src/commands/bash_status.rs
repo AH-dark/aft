@@ -64,6 +64,15 @@ struct BashStatusParams {
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
+    handle_with_observation_only(req, ctx, false)
+}
+
+/// `observation_only` is transport-owned, never read from tool arguments.
+pub(crate) fn handle_with_observation_only(
+    req: &RawRequest,
+    ctx: &AppContext,
+    observation_only: bool,
+) -> Response {
     let raw_params = req
         .params
         .get("params")
@@ -104,7 +113,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // A delegated worker reading a task's status is waiting on it (its
     // `bash_watch` polls this): keep the task's default hard kill at least one
     // worker wait limit away. See `BgTaskRegistry::renew_hard_kill`.
-    if req.worker_session() && store_unavailable.is_none() {
+    if !observation_only && req.worker_session() && store_unavailable.is_none() {
         ctx.bash_background().renew_hard_kill(
             &task_id,
             req.session(),
@@ -113,13 +122,32 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             ),
         );
     }
-    if ctx.bash_background().has_erased_watch_reference(&task_id) {
+    let erased = if observation_only {
+        ctx.bash_background()
+            .observed_erased_watch_reference(&task_id)
+    } else {
+        ctx.bash_background().has_erased_watch_reference(&task_id)
+    };
+    if erased {
         return Response::error(&req.id, "task_erased", format_erased_task_message(&task_id));
     }
     // Settled: a kill in flight is waited out (bounded) so callers that stop
     // polling at the first non-running status see its terminal outcome.
     let mut disk_paths = None;
-    let own_snapshot = if store_unavailable.is_some() {
+    let own_snapshot = if observation_only {
+        ctx.bash_background()
+            .observation_status(
+                &task_id,
+                req.session(),
+                project_root,
+                &storage_dir,
+                PREVIEW_BYTES,
+            )
+            .map(|(snapshot, paths)| {
+                disk_paths = Some(paths);
+                snapshot
+            })
+    } else if store_unavailable.is_some() {
         ctx.bash_background()
             .terminal_status_from_disk(&task_id, req.session(), project_root, &storage_dir)
             .map(|(snapshot, paths)| {
@@ -142,7 +170,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 .bash_background()
                 .readable_worker_task_owner(&task_id, &storage_dir);
             let owner = worker_owner.as_deref()?;
-            if store_unavailable.is_some() {
+            if observation_only {
+                ctx.bash_background()
+                    .observation_status(&task_id, owner, None, &storage_dir, PREVIEW_BYTES)
+                    .map(|(snapshot, paths)| {
+                        disk_paths = Some(paths);
+                        snapshot
+                    })
+            } else if store_unavailable.is_some() {
                 ctx.bash_background()
                     .terminal_status_from_disk(&task_id, owner, None, &storage_dir)
                     .map(|(snapshot, paths)| {
@@ -162,7 +197,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .or_else(|| {
             // Standalone unstamped tasks retain their existing same-project fallback.
             // Scoped calls must not search other sessions after an exact miss.
-            if crate::access_policy::current_scope().is_none() && store_unavailable.is_none() {
+            if !observation_only
+                && crate::access_policy::current_scope().is_none()
+                && store_unavailable.is_none()
+            {
                 ctx.bash_background().status_settled(
                     &task_id,
                     req.session(),

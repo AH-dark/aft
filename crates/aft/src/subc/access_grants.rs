@@ -288,6 +288,11 @@ pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
 /// to Cingulate, the consent service, never to a plugin prompt. Other routes
 /// use their plugin UI or reverse elicitation, never the consent service.
 pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
+    // A rich-UI read has nobody to answer a permission question. Existing
+    // grants still apply, but access requiring a new approval must be denied.
+    if super::carrier_read_only::restricted(identity) {
+        return crate::access_policy::AskRoute::Deny;
+    }
     // No path yet carries a codemode call's question to the head agent's
     // user, so such a call is refused rather than asked or allowed.
     if identity.run_owner.is_some() {

@@ -280,6 +280,17 @@ pub(crate) fn handle_deferred_with_budget(
     ctx: Arc<AppContext>,
     budget: crate::commands::blocking_wait::ReplyBudget,
 ) -> DispatchOutcome {
+    handle_deferred_with_observation_only(req, ctx, budget, false)
+}
+
+/// An observation-only transport may wait on output, but cannot renew, recover,
+/// or otherwise change the task that produced it. The flag is not a tool argument.
+pub(crate) fn handle_deferred_with_observation_only(
+    req: &RawRequest,
+    ctx: Arc<AppContext>,
+    budget: crate::commands::blocking_wait::ReplyBudget,
+    observation_only: bool,
+) -> DispatchOutcome {
     let id = req.id.clone();
     let params = match parse_params(req) {
         Ok(params) => params,
@@ -315,7 +326,12 @@ pub(crate) fn handle_deferred_with_budget(
     let session = req.session().to_string();
     let shell_tool = req.host_tool_names().shell().to_string();
     let registry = ctx.bash_background().clone();
-    if registry.has_erased_watch_reference(&task_id) {
+    let erased = if observation_only {
+        registry.observed_erased_watch_reference(&task_id)
+    } else {
+        registry.has_erased_watch_reference(&task_id)
+    };
+    if erased {
         return DispatchOutcome::Immediate(Response::error(
             &id,
             "task_erased",
@@ -344,7 +360,7 @@ pub(crate) fn handle_deferred_with_budget(
                 // Configure acknowledges the route before its replay tail finishes.
                 // Resolve the durable record before starting the wait, off executor
                 // slots, and without replaying unrelated tasks or relaxing the session.
-                if registry.observed_status(&task_id, &session, 0).is_none() {
+                if !observation_only && registry.observed_status(&task_id, &session, 0).is_none() {
                     registry.set_worker_wait_window(Duration::from_millis(worker_limit_ms));
                     if let Err(error) = registry.recover_watch_task(
                         &storage_dir,
@@ -357,14 +373,6 @@ pub(crate) fn handle_deferred_with_budget(
                         return;
                     }
                 }
-                if registry.observed_status(&task_id, &session, 0).is_none() {
-                    let _ = tx.send(Response::error(
-                        &thread_id,
-                        "task_not_found",
-                        format_unknown_polled_task_message(&task_id, &shell_tool),
-                    ));
-                    return;
-                }
                 let watch = WatchJob {
                     registry,
                     task_id,
@@ -375,7 +383,18 @@ pub(crate) fn handle_deferred_with_budget(
                     worker_limit_ms,
                     primary_cap_ms,
                     budget,
+                    observation_only,
+                    storage_dir,
+                    project_root,
                 };
+                if watch.observed_status(0).is_none() {
+                    let _ = tx.send(Response::error(
+                        &thread_id,
+                        "task_not_found",
+                        format_unknown_polled_task_message(&watch.task_id, &shell_tool),
+                    ));
+                    return;
+                }
                 let Some(waited) = watch.wait(&worker_cancellation) else {
                     // Cancelled: the transport already answered the call.
                     return;
@@ -383,10 +402,7 @@ pub(crate) fn handle_deferred_with_budget(
                 // The task was already resolved under this route's identity. Do not
                 // re-adopt another session's task through status's relaxed fallback if
                 // the record disappears while the watch is waiting.
-                let snapshot =
-                    watch
-                        .registry
-                        .observed_status(&watch.task_id, &watch.session, PREVIEW_BYTES);
+                let snapshot = watch.observed_status(PREVIEW_BYTES);
                 let response = match snapshot {
                     Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
                     None => Response::error(
@@ -446,9 +462,29 @@ struct WatchJob {
     worker_limit_ms: u64,
     primary_cap_ms: u64,
     budget: crate::commands::blocking_wait::ReplyBudget,
+    observation_only: bool,
+    storage_dir: std::path::PathBuf,
+    project_root: Option<std::path::PathBuf>,
 }
 
 impl WatchJob {
+    fn observed_status(&self, preview_bytes: usize) -> Option<BgTaskSnapshot> {
+        if self.observation_only {
+            self.registry
+                .observation_status(
+                    &self.task_id,
+                    &self.session,
+                    self.project_root.as_deref(),
+                    &self.storage_dir,
+                    preview_bytes,
+                )
+                .map(|(snapshot, _)| snapshot)
+        } else {
+            self.registry
+                .observed_status(&self.task_id, &self.session, preview_bytes)
+        }
+    }
+
     /// Waits until the task exits, the pattern matches, or the limit passes.
     /// `None` when the call was cancelled first.
     fn wait(&self, cancellation: &crate::executor::JobCancellation) -> Option<Waited> {
@@ -472,16 +508,14 @@ impl WatchJob {
             // A worker waiting on its task keeps the task's default hard kill
             // at least one worker wait limit away, as every other worker wait
             // does (see `BgTaskRegistry::renew_hard_kill`).
-            if self.worker {
+            if self.worker && !self.observation_only {
                 self.registry.renew_hard_kill(
                     &self.task_id,
                     &self.session,
                     Duration::from_millis(self.worker_limit_ms),
                 );
             }
-            let snapshot = self
-                .registry
-                .observed_status(&self.task_id, &self.session, 0);
+            let snapshot = self.observed_status(0);
             let mut terminal = snapshot
                 .as_ref()
                 .is_none_or(|snapshot| snapshot.info.status.is_terminal());
@@ -581,13 +615,36 @@ impl WatchJob {
                 scan.has_more = true;
                 continue;
             }
-            let page = match self.registry.read_artifact_page_until(
-                &self.task_id,
-                &self.session,
-                artifact,
-                scan.next,
-                self.budget.deadline,
-            ) {
+            let page = if self.observation_only {
+                self.registry
+                    .observation_status(
+                        &self.task_id,
+                        &self.session,
+                        self.project_root.as_deref(),
+                        &self.storage_dir,
+                        0,
+                    )
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "task_not_found")
+                    })
+                    .and_then(|(_, paths)| {
+                        self.registry.observation_artifact_page_until(
+                            paths,
+                            artifact,
+                            scan.next,
+                            self.budget.deadline,
+                        )
+                    })
+            } else {
+                self.registry.read_artifact_page_until(
+                    &self.task_id,
+                    &self.session,
+                    artifact,
+                    scan.next,
+                    self.budget.deadline,
+                )
+            };
+            let page = match page {
                 Ok(page) => page,
                 Err(error) => {
                     // The helper's queue-wait or access cap can expire before the reply deadline.
@@ -946,6 +1003,9 @@ mod tests {
                 worker_limit_ms: 1_800_000,
                 primary_cap_ms: 120_000,
                 budget: Instant::now().into(),
+                observation_only: false,
+                storage_dir: storage,
+                project_root: Some(dir.path().into()),
             };
             (dir, job, snapshot)
         })
