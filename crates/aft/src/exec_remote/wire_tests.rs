@@ -107,6 +107,12 @@ pub(crate) fn signer_refusal(detail: &str, retry_after_ms: Option<u64>) -> Termi
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(crate) enum Script {
+    Submission {
+        never_accepted: bool,
+        mismatch: bool,
+        always_unknown: bool,
+        disconnect: bool,
+    },
     Lost,
     Refused,
     Restart,
@@ -293,6 +299,7 @@ pub(crate) async fn daemon_with_capabilities(
     let claims: Vec<String> = claims.iter().map(|claim| (*claim).to_string()).collect();
     let server = tokio::spawn(async move {
         let mut runs = 0;
+        let mut submission: Option<Value> = None;
         for _ in 0..clients {
             let (mut socket, _) = listener.accept().await.unwrap();
             subc_transport::authenticate_server(
@@ -351,6 +358,37 @@ pub(crate) async fn daemon_with_capabilities(
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
+                            if let Script::Submission { never_accepted, mismatch, always_unknown, disconnect } = script {
+                                let mut request = body["params"].clone();
+                                let cursor = request.as_object_mut().unwrap().remove("resume_from_seq").and_then(|v| v.as_u64());
+                                let keyed = request["submission_key"].is_string();
+                                let same_key = keyed && submission.as_ref().is_some_and(|old| old["submission_key"] == request["submission_key"]);
+                                let refusal = same_key && (mismatch || submission.as_ref() != Some(&request) || never_accepted);
+                                let unknown = runs == 1 || always_unknown;
+                                if !same_key { submission = Some(request); }
+                                if refusal {
+                                    // Refusals have their own ID, never the existing job's ID.
+                                    let record = TerminalRecord::new(Uuid::from_bytes([0x77;16]), Outcome::RefusedBeforeStart {
+                                        reason: if never_accepted { RefusalReason::SubmissionNeverAccepted } else { RefusalReason::RequestRejected }
+                                    }, 0, 0, 0).with_refusal_detail(if never_accepted { "submission_never_accepted" } else { "submission_key_mismatch" });
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(record)).unwrap()));
+                                } else {
+                                    if !(never_accepted && unknown) {
+                                        replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1).with_attached(same_key))).unwrap()));
+                                        // ck-motor's keyed replay cursor is exclusive. Without a cursor
+                                        // it replays the whole stream, including already delivered lines.
+                                        let from = cursor.map_or(0, |seq| seq + 1);
+                                        let end = if unknown { 2 } else { 4 };
+                                        for seq in from..end {
+                                            replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(format!("line-{seq}\n").into_bytes())))).unwrap()));
+                                        }
+                                    }
+                                    if !(disconnect && runs == 1) {
+                                        replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(TerminalRecord::new(id(), if unknown { Outcome::OutcomeUnknown } else { Outcome::Exit { code: 0 } }, 0, 0, 0))).unwrap()));
+                                    }
+                                }
+                                if !(disconnect && runs == 1) { replies.push(reply(FrameType::StreamEnd, Value::Null)); }
+                            } else {
                             let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } | Script::SignerRefused { refusals, .. } if runs <= refusals)
                                 || matches!(script, Script::DrainingThenSigner { signer_refusals, .. } if runs <= 1 + signer_refusals)
                                 || matches!(script, Script::DrainingGatedAcceptance) && runs == 1;
@@ -474,6 +512,7 @@ pub(crate) async fn daemon_with_capabilities(
                                 }
                                 replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());
                             }
+                            }
                         },
                         "exec.cancel" if matches!(script, Script::CancelRefused) => replies.push(reply(FrameType::Error, json!({"code":"cancel_refused","message":"runner unavailable"}))),
                         "exec.cancel" => { cancelled = true; stop.store(true,std::sync::atomic::Ordering::SeqCst); replies.push(reply(FrameType::Response, serde_json::to_value(CancelReply::new(id())).unwrap())); },
@@ -488,6 +527,17 @@ pub(crate) async fn daemon_with_capabilities(
                     subc_transport::write_frame(&mut *writer.lock().await, &response)
                         .await
                         .unwrap();
+                }
+                if matches!(
+                    script,
+                    Script::Submission {
+                        disconnect: true,
+                        ..
+                    }
+                ) && runs == 1
+                    && body["method"] == "exec.run"
+                {
+                    break;
                 }
                 if let Script::GatedAdmission { refuse } = script {
                     if body["method"] == "exec.run" {
