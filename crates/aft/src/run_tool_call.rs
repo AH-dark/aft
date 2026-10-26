@@ -14,6 +14,25 @@ pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
 /// append trailing lines (the AFT status bar) that every transport then delivers unchanged.
 pub type FinalizeFn<'a> = dyn Fn(&mut Response, &mut String) + 'a;
 
+#[cfg(test)]
+thread_local! {
+    /// Every string a prepare asked the edit translator to classify as a glob
+    /// or a file, recorded for the tests that pin how much filesystem
+    /// validation a prepare does.
+    static EDIT_TARGET_PROBES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_edit_target_probe(resolved: &str) {
+    EDIT_TARGET_PROBES.with(|probes| probes.borrow_mut().push(resolved.to_string()));
+}
+
+#[cfg(test)]
+pub(crate) fn take_edit_target_probes_for_test() -> Vec<String> {
+    EDIT_TARGET_PROBES.with(|probes| std::mem::take(&mut *probes.borrow_mut()))
+}
+
 /// Wall and optional thread-CPU timestamps for one subc tool call. Synchronous
 /// boundaries read thread CPU on Linux/macOS; Windows lacks a sufficiently fine
 /// clock and reports unknown CPU. Sampling does not perform file I/O.
@@ -477,6 +496,8 @@ pub(crate) fn prepare_tool_call(
         // as before instead of dispatching it for a permission request.
         let request_id = ctx.request_id.as_str();
         let edit_target_is_glob = |resolved: &str| {
+            #[cfg(test)]
+            record_edit_target_probe(resolved);
             crate::commands::edit_match::classify_edit_target(resolved, app_ctx, request_id)
                 != crate::commands::edit_match::EditTargetKind::Literal
         };
@@ -1300,6 +1321,55 @@ mod tests {
             for private in ["secret_needle", "private.rs", "pub fn"] {
                 assert!(!line.contains(private), "{private:?} leaked into {line}");
             }
+        }
+    }
+
+    /// A plain edit target is a file from its spelling, so a prepare never
+    /// spends a filesystem validation (canonicalising every ancestor, asking
+    /// the storage floor) on it; that validation belongs to the handler. The
+    /// call runs through `run_tool_call`, so this sees the probe the translator
+    /// is really handed, and a plain target records none.
+    #[test]
+    fn plain_edit_target_never_reaches_path_validation_during_prepare() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let file = root.join("plain-target.ts");
+        assert!(
+            !crate::commands::edit_match::is_glob_pattern(&file.display().to_string()),
+            "test path {file:?} has glob characters"
+        );
+        // Line-range items make this a multi-item batch, the one edit shape
+        // that consults the probe; their content defines the new file, so the
+        // prepare succeeds without the handler being able to find old text.
+        let items: Vec<Value> = (0..10)
+            .map(|index| {
+                json!({
+                    "startLine": index * 3 + 1,
+                    "endLine": index * 3 + 1,
+                    "content": format!("const value_{index} = 2;\n"),
+                })
+            })
+            .collect();
+        let _ = take_edit_target_probes_for_test();
+
+        let _ = slow_edit_line(
+            &AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(root.clone()),
+                    ..Default::default()
+                },
+            ),
+            &root,
+            json!({ "path": file, "edits": items }),
+        );
+
+        let probes = take_edit_target_probes_for_test();
+        for probe in &probes {
+            assert!(
+                crate::commands::edit_match::is_glob_pattern(probe),
+                "a target without glob characters reached path validation: {probe}"
+            );
         }
     }
 

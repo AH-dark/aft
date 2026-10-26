@@ -5197,3 +5197,6 @@ mod outline_target_validation_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod latency_probe_tests;
