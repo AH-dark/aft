@@ -4138,7 +4138,7 @@ mod tests {
             "/work/repo",
             "0123456789abcdef",
         )
-        .field("tool", "x".repeat(300))
+        .field("tool", "x".repeat(190))
         .field("status", "x".repeat(300))
         .field("ready_to_first_query_ms", 42);
         let line = format_index_event_line(&event);
