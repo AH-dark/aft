@@ -1,0 +1,1 @@
+Rust call-graph publication now reuses an extraction-local index of function subtrees and same-file constructors instead of repeatedly walking the syntax tree for each receiver. Published graph facts and query outputs are unchanged; no process-wide extraction cache or store-write permission change is introduced.
