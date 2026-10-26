@@ -9297,11 +9297,17 @@ impl PlainToolRun {
             };
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _result_body = result_body::enter(identity_for_run.tool_result_body);
+            let observation_only = carrier_read_only::restricted(&identity_for_run);
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
                 // Both the tool's run and the reply's finishing use the trace.
                 let phase_trace = std::cell::RefCell::new(Some(phase_trace));
                 let finalizer = |response: &mut Response, text: &mut String| {
+                    // A UI copy must leave completions and cancellation notices
+                    // available to the session that actually owns the command.
+                    if observation_only {
+                        return;
+                    }
                     crate::response_finalize::finalize_tool_response(
                         response,
                         text,
@@ -9324,6 +9330,17 @@ impl PlainToolRun {
                     });
                     crate::sandbox_spawn::ToolLaunchPolicy::with_current(tool_policy, || {
                         let mut trace = phase_trace.borrow_mut();
+                        let dispatch = |request: RawRequest, ctx: &AppContext| {
+                            if observation_only && bare_name == "bash_status" {
+                                crate::commands::bash_status::handle_with_observation_only(
+                                    &request,
+                                    ctx,
+                                    observation_only,
+                                )
+                            } else {
+                                dispatch(request, ctx)
+                            }
+                        };
                         run_tool_call(
                             &bare_name,
                             arguments,
@@ -10552,10 +10569,11 @@ async fn handle_tool_call(
                                 matches!(bind_trust, BindTrust::Untrusted),
                             )
                         } else if bare_name_for_run == "bash_watch" {
-                            crate::commands::bash_watch::handle_deferred_with_budget(
+                            crate::commands::bash_watch::handle_deferred_with_observation_only(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
                                 reply_budget,
+                                carrier_read_only::restricted(&identity_for_run),
                             )
                         } else {
                             crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_reply_deadline(
@@ -10590,6 +10608,9 @@ async fn handle_tool_call(
                                 let response = crate::bounded_io::finish_response(response);
                                 phase_trace.mark_execute_done();
                                 let finalizer = |response: &mut Response, text: &mut String| {
+                                    if carrier_read_only::restricted(&identity_for_run) {
+                                        return;
+                                    }
                                     crate::response_finalize::finalize_tool_response(
                                         response,
                                         text,
@@ -11325,6 +11346,11 @@ async fn deliver_resolved_subc_response(
     }
     entry.phase_trace.mark_execute_done_after_await();
     let finalizer = |response: &mut Response, text: &mut String| {
+        // A rich-UI result is a copy, not delivery to the worker: finalization
+        // must not acknowledge completions or consume cancellation notices.
+        if carrier_read_only::restricted(identity) {
+            return;
+        }
         if let Some(ctx) = &ctx {
             crate::response_finalize::finalize_tool_response(
                 response,

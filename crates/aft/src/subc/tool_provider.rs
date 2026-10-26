@@ -5093,14 +5093,12 @@ mod route_tests {
                         }
                         deferred_tx.wake.notified().await;
                     };
-                    let text = crate::subc_format::format_response_with_context(
-                        &entry.bare_name, &response, &entry.format_context,
-                    );
-                    let result = ToolCallResult { text, response };
-                    build_tool_response_frame_with_limit(
-                        entry.ver, entry.route, entry.corr, entry.flags, &result,
-                        routes.get(&entry.route).unwrap().reply_policy(), 1024 * 1024,
-                    ).unwrap()
+                    deliver_resolved_subc_response(
+                        &writer, ResolvedSubcResponse { entry, response }, routes,
+                        &mut HashMap::new(), executor, &Arc::default(),
+                        &Arc::new(Notify::new()), metrics, 1024 * 1024,
+                    ).await.unwrap();
+                    replies.recv().await.unwrap()
                 }
             }
         })
@@ -5690,6 +5688,171 @@ mod route_tests {
                     }
                 }
             }
+        }
+    }
+
+    fn task_poll_identity(root: &ProjectRootId, session: &str, carrier: bool) -> RouteIdentity {
+        let mut identity = if carrier {
+            occipital_identity(root, RouteRole::ToolProviderV1)
+        } else {
+            test_support::route_identity(root, session)
+        };
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.role = RouteRole::ToolProviderV1;
+        data.scope = Some(stamp("worker"));
+        data.session = session.into();
+        if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal {
+            *session_id = session.into();
+        }
+        identity
+    }
+
+    async fn task_poll_deadline_case(name: &str) {
+        use crate::bash_background::persistence::read_task;
+        for carrier in [true, false] {
+            let (dir, ctx, task) =
+                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            ctx.update_config(|config| config.bash.worker_wait_max_ms = 3_600_000);
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let before = std::fs::read(&task.paths.json).unwrap();
+            let before_limit = read_task(&task.paths.json).unwrap().timeout_ms.unwrap();
+            let ctx = Arc::new(ctx);
+            let mut arguments = json!({"taskId":task.task_id});
+            if name == "bash_watch" {
+                arguments["timeoutMs"] = json!(1);
+            }
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                task_poll_identity(&root, &task.session_id, carrier),
+                ctx.clone(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+            assert_eq!(body["isError"], false, "{name}: {body}");
+            let after = read_task(&task.paths.json).unwrap();
+            let live_limit = ctx
+                .bash_background()
+                .hard_kill_deadline(&task.task_id, &task.session_id)
+                .unwrap()
+                .limit_ms;
+            if carrier {
+                assert_eq!(
+                    after.timeout_ms,
+                    Some(before_limit),
+                    "carrier {name} changed the persisted deadline"
+                );
+                assert_eq!(
+                    live_limit, before_limit,
+                    "carrier {name} changed the live deadline"
+                );
+                assert_eq!(
+                    std::fs::read(&task.paths.json).unwrap(),
+                    before,
+                    "carrier {name} rewrote task metadata"
+                );
+            } else {
+                assert!(
+                    after.timeout_ms.unwrap() > before_limit,
+                    "worker {name} did not persist its renewal"
+                );
+                assert!(live_limit > before_limit, "worker {name} did not renew");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_status_does_not_renew_but_worker_status_does() {
+        task_poll_deadline_case("bash_status").await;
+    }
+
+    #[tokio::test]
+    async fn occipital_watch_does_not_renew_but_worker_watch_does() {
+        task_poll_deadline_case("bash_watch").await;
+    }
+
+    #[tokio::test]
+    async fn occipital_watch_does_not_acknowledge_worker_completion() {
+        use crate::bash_background::{
+            persistence::{read_task, write_task},
+            BgTaskStatus,
+        };
+        for carrier in [true, false] {
+            let (dir, ctx, task) =
+                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            {
+                let mut state = task.lock_state().unwrap();
+                state
+                    .metadata
+                    .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+                state.metadata.completion_delivered = false;
+                write_task(&task.paths.json, &state.metadata).unwrap();
+            }
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let reply = exchange_with_actor(
+                json!({"name":"bash_watch","preset":"worker","arguments":{"taskId":task.task_id,"timeoutMs":1}}),
+                task_poll_identity(&root, &task.session_id, carrier), Arc::new(ctx),
+                &Arc::new(DispatchPathMetrics::new()),
+                |_, _| panic!("watch uses the deferred handler"),
+            ).await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(body["isError"], false, "{body}");
+            assert_eq!(
+                read_task(&task.paths.json).unwrap().completion_delivered,
+                !carrier,
+                "only the worker's watch may acknowledge its completion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn occipital_cold_task_reads_do_not_register_or_rewrite_tasks() {
+        for name in ["bash_status", "bash_watch"] {
+            let (dir, original, task) =
+                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            std::fs::write(&task.paths.stdout, "observed-output-marker").unwrap();
+            std::fs::write(&task.paths.stderr, "").unwrap();
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                original.config().as_ref().clone(),
+            ));
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let before = std::fs::read(&task.paths.json).unwrap();
+            let mut arguments = json!({"taskId":task.task_id});
+            if name == "bash_watch" {
+                arguments["pattern"] = json!("observed-output-marker");
+                arguments["timeoutMs"] = json!(100);
+            }
+            let reply = exchange_with_actor(
+                json!({"name":name,"preset":"worker","arguments":arguments}),
+                task_poll_identity(&root, &task.session_id, true),
+                ctx.clone(),
+                &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+            )
+            .await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
+            assert_eq!(body["isError"], false, "{name}: {body}");
+            if name == "bash_watch" {
+                assert!(
+                    body.to_string().contains("observed-output-marker"),
+                    "{name}: {body}"
+                );
+            } else {
+                assert!(body.to_string().contains("running"), "{name}: {body}");
+            }
+            assert!(
+                ctx.bash_background().task_for_test(&task.task_id).is_none(),
+                "carrier {name} registered the task and could re-arm its durable watches"
+            );
+            assert_eq!(
+                std::fs::read(&task.paths.json).unwrap(),
+                before,
+                "carrier {name} rewrote the task bundle"
+            );
         }
     }
 
