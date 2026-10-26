@@ -1702,7 +1702,75 @@ const RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE: &str = "runon refused: the command chan
 const RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE: &str = "runon refused: the command changes into <path>, which is not valid on the Windows runner because absolute command paths are not translated (checkout <checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
 
 #[cfg(unix)]
+fn runon_snapshot_directory_known(checkout: &Path, path: &Path, git: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(checkout) else {
+        return false;
+    };
+    // The MOTOR build runner's snapshot contract (MOTOR repository,
+    // docs/snapshot-contents.md, sections 2–3) carries existing tracked files and
+    // non-ignored untracked files, but reserves each checkout's top-level target
+    // for runner-owned build output. Ask Git itself about standard excludes and
+    // tracked overrides; a directory needs a copied file beneath it as proof.
+    // Uncertain membership retains the failure cwd and its checkout-escape
+    // refusals, rather than assuming a directory change succeeds remotely.
+    if relative.starts_with("target") || !path.is_dir() {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let relative = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    let mut command = std::process::Command::new(git);
+    command
+        .current_dir(checkout)
+        .arg("--literal-pathspecs")
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ])
+        .arg(relative)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Source-file lists regularly exceed capture_probe_command's 4 KiB limit.
+    // Use the normal bounded capture; truncated output still stays unknown.
+    crate::format::isolate_in_process_group(&mut command);
+    let Ok(child) = command.spawn() else {
+        return false;
+    };
+    let Ok(files) = crate::format::wait_with_deadline(child, "git", deadline, || false) else {
+        return false;
+    };
+    // Capture decodes bytes lossily; a replacement path is not evidence that
+    // the listed file still exists in the working tree.
+    files.status.success()
+        && !files.truncated
+        && !files.stdout.contains('\u{fffd}')
+        && files.stdout.split_terminator('\0').any(|file| {
+            !Path::new(file).starts_with("target")
+                && std::fs::symlink_metadata(checkout.join(file))
+                    .is_ok_and(|metadata| !metadata.is_dir())
+        })
+}
+
+#[cfg(unix)]
 fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String>, exec::Error> {
+    runon_cd_refusal_with_git(command, request, Path::new("git"))
+}
+
+#[cfg(unix)]
+fn runon_cd_refusal_with_git(
+    command: &str,
+    request: &RunRequest,
+    git: &Path,
+) -> Result<Option<String>, exec::Error> {
     let checkout = Path::new(&request.workspace_key);
     let cwd = exec::DirectoryKind::WorkingDirectory.canonicalize(Path::new(&request.cwd))?;
     // Sibling wire paths are absolute and are not rebased on Linux. A linked
@@ -1739,7 +1807,21 @@ fn runon_cd_refusal(command: &str, request: &RunRequest) -> Result<Option<String
     let copied = |path: &Path| {
         path.starts_with(checkout) || siblings.iter().any(|sibling| path.starts_with(sibling))
     };
-    let known_directory = |path: &Path| copied(path) && path.is_dir();
+    let known_directories = std::cell::RefCell::new(BTreeMap::<PathBuf, bool>::new());
+    let known_directory = |path: &Path| {
+        if let Some(known) = known_directories.borrow().get(path) {
+            return *known;
+        }
+        let known = std::iter::once(checkout)
+            .chain(siblings.iter().map(PathBuf::as_path))
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .is_some_and(|root| runon_snapshot_directory_known(root, path, git));
+        known_directories
+            .borrow_mut()
+            .insert(path.to_path_buf(), known);
+        known
+    };
     Ok(
         crate::bash_permissions::scan::top_level_directory_targets(command, &cwd, &known_directory)
             .into_iter()

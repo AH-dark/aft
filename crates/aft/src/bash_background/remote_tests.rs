@@ -10212,6 +10212,7 @@ async fn runon_cd_background_jobs_preserve_foreground_directory() {
         .unwrap();
     let ctx = remote_test_context(checkout.path());
     fs::create_dir(checkout.path().join("nested")).unwrap();
+    fs::write(checkout.path().join("nested/source.txt"), "source\n").unwrap();
     let marker = checkout.path().join("must-not-run-locally");
     for (line, refused) in [
         ("sleep 1 & cd ..", true),
@@ -10415,6 +10416,7 @@ async fn runon_cd_skipped_changes_do_not_hide_checkout_exits() {
         .unwrap();
     let ctx = remote_test_context(checkout.path());
     fs::create_dir(checkout.path().join("nested")).unwrap();
+    fs::write(checkout.path().join("nested/source.txt"), "source\n").unwrap();
     let marker = checkout.path().join("must-not-run-locally");
     for (line, refused) in [
         ("false && cd nested; cd ..", true),
@@ -10487,7 +10489,8 @@ async fn runon_cd_sequences_use_existing_copied_directories() {
         sibling.join("a"),
         sibling.join("b"),
     ] {
-        fs::create_dir_all(folder).unwrap();
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("source.txt"), "source\n").unwrap();
     }
     git_fixture(&sibling);
     let ctx = remote_test_context(&checkout);
@@ -10531,6 +10534,181 @@ async fn runon_cd_sequences_use_existing_copied_directories() {
             assert_eq!(runs[0]["command"], command);
         }
         assert!(!marker.exists(), "runon must never spawn locally");
+    }
+}
+
+fn runon_cd_snapshot_fixture() -> (tempfile::TempDir, RunRequest) {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("aft-runon-snapshot-cwd-")
+        .tempdir_in(home)
+        .unwrap();
+    let checkout = dir.path().join("workspace/checkout");
+    git_fixture(&checkout);
+    let request = build_remote_request(
+        &checkout,
+        &checkout,
+        "true",
+        BTreeMap::new(),
+        30,
+        &exec::PresetParams::default(),
+    )
+    .unwrap();
+    (dir, request)
+}
+
+#[test]
+fn runon_cd_snapshot_ignored_existing_directories_keep_failure_branch() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let checkout = PathBuf::from(&request.workspace_key);
+    fs::write(checkout.join(".gitignore"), "node_modules/\ndeleted/\n").unwrap();
+    fs::write(checkout.join(".git/info/exclude"), "excluded/\n").unwrap();
+    let global = checkout.join("global-ignore");
+    fs::write(&global, "globalignored/\n").unwrap();
+    hermetic_git(
+        &checkout,
+        &["config", "core.excludesFile", global.to_str().unwrap()],
+    );
+    fs::create_dir_all(checkout.join("nested")).unwrap();
+    fs::write(checkout.join("nested/.gitignore"), "cache/\n").unwrap();
+    for folder in [
+        "node_modules/x",
+        "excluded/x",
+        "globalignored/x",
+        "nested/cache/x",
+        "deleted/x",
+    ] {
+        fs::create_dir_all(checkout.join(folder)).unwrap();
+        if folder != "deleted/x" {
+            fs::write(checkout.join(folder).join("source.txt"), "not copied\n").unwrap();
+        }
+    }
+    fs::write(checkout.join("deleted/x/tracked.txt"), "deleted\n").unwrap();
+    hermetic_git(&checkout, &["add", "-f", "deleted/x/tracked.txt"]);
+    fs::remove_file(checkout.join("deleted/x/tracked.txt")).unwrap();
+    let sibling = checkout.parent().unwrap().join("sibling");
+    git_fixture(&sibling);
+    fs::write(sibling.join(".gitignore"), "node_modules/\n").unwrap();
+    fs::create_dir_all(sibling.join("node_modules/x")).unwrap();
+    fs::write(sibling.join("node_modules/x/source.txt"), "not copied\n").unwrap();
+    request.siblings = vec![sibling.to_str().unwrap().to_owned()];
+    for line in [
+        "cd node_modules/x; cd ../..",
+        "cd excluded/x; cd ../..",
+        "cd globalignored/x; cd ../..",
+        "cd nested/cache/x; cd ../../..",
+        "cd deleted/x; cd ../..",
+        "cd ../sibling/node_modules/x; cd ../../../checkout",
+    ] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_directories_without_copied_files_keep_failure_branch() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    fs::write(checkout.join(".gitignore"), "*.cache\n").unwrap();
+    fs::create_dir_all(checkout.join("empty/x")).unwrap();
+    fs::create_dir_all(checkout.join("onlyignored/x")).unwrap();
+    fs::write(checkout.join("onlyignored/x/file.cache"), "not copied\n").unwrap();
+    for line in ["cd empty/x; cd ../..", "cd onlyignored/x; cd ../.."] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_nonignored_and_tracked_directories_are_known() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let checkout = PathBuf::from(&request.workspace_key);
+    fs::write(checkout.join(".gitignore"), "forced/\n").unwrap();
+    for folder in ["tracked/x", "untracked/x", "forced/x", "src/target"] {
+        fs::create_dir_all(checkout.join(folder)).unwrap();
+        fs::write(checkout.join(folder).join("file.txt"), "source\n").unwrap();
+    }
+    hermetic_git(&checkout, &["add", "tracked/x/file.txt"]);
+    hermetic_git(&checkout, &["add", "-f", "forced/x/file.txt"]);
+    let sibling = checkout.parent().unwrap().join("sibling");
+    git_fixture(&sibling);
+    fs::write(sibling.join(".gitignore"), "forced/\n").unwrap();
+    fs::create_dir_all(sibling.join("forced/x")).unwrap();
+    fs::write(sibling.join("forced/x/file.txt"), "source\n").unwrap();
+    hermetic_git(&sibling, &["add", "-f", "forced/x/file.txt"]);
+    request.siblings = vec![sibling.to_str().unwrap().to_owned()];
+    for line in [
+        "cd tracked/x; cd ../..",
+        "cd untracked/x; cd ../..",
+        "cd forced/x; cd ../..",
+        "cd src/target; cd ../..",
+        "cd ../sibling/forced/x; cd ../../../checkout",
+    ] {
+        assert_eq!(runon_cd_refusal(line, &request).unwrap(), None, "{line}");
+    }
+}
+
+#[test]
+fn runon_cd_snapshot_mc_package_sequence_is_allowed() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    for package in ["pi-plugin", "plugin"] {
+        let path = checkout.join("packages").join(package);
+        fs::create_dir_all(&path).unwrap();
+        for index in 0..200 {
+            fs::write(path.join(format!("source-{index:03}.ts")), "source\n").unwrap();
+        }
+    }
+    let line =
+        "cd packages/pi-plugin && bun test src/__tests__; cd ../plugin && bun test src/__tests__";
+    assert_eq!(runon_cd_refusal(line, &request).unwrap(), None);
+}
+
+#[test]
+fn runon_cd_snapshot_missing_git_keeps_failure_branch() {
+    let (_dir, request) = runon_cd_snapshot_fixture();
+    let checkout = Path::new(&request.workspace_key);
+    fs::create_dir_all(checkout.join("source/x")).unwrap();
+    fs::write(checkout.join("source/x/source.txt"), "source\n").unwrap();
+    assert_eq!(
+        runon_cd_refusal("cd source/x; cd ../..", &request).unwrap(),
+        None
+    );
+    assert!(runon_cd_refusal_with_git(
+        "cd source/x; cd ../..",
+        &request,
+        &checkout.join("missing-git"),
+    )
+    .unwrap()
+    .is_some());
+}
+
+#[test]
+fn runon_cd_snapshot_top_level_target_is_not_source() {
+    let (_dir, mut request) = runon_cd_snapshot_fixture();
+    let checkout = PathBuf::from(&request.workspace_key);
+    let sibling = checkout.parent().unwrap().join("sibling");
+    git_fixture(&sibling);
+    for root in [&checkout, &sibling] {
+        fs::create_dir_all(root.join("target/x")).unwrap();
+        fs::write(root.join("target/x/tracked.txt"), "not copied\n").unwrap();
+        hermetic_git(root, &["add", "-f", "target/x/tracked.txt"]);
+    }
+    request.siblings = vec![sibling.to_str().unwrap().to_owned()];
+    for line in [
+        "cd target/x; cd ../..",
+        "cd ../sibling/target/x; cd ../../../checkout",
+    ] {
+        assert!(
+            runon_cd_refusal(line, &request).unwrap().is_some(),
+            "{line}"
+        );
     }
 }
 
