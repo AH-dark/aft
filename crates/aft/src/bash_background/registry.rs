@@ -6215,6 +6215,56 @@ impl BgTaskRegistry {
         project_root: Option<&Path>,
         harness: Option<&str>,
     ) -> Result<(), String> {
+        self.recover_task_if(
+            storage_dir,
+            session_id,
+            task_id,
+            project_root,
+            harness,
+            |_| true,
+        )
+    }
+
+    /// Restore an explicitly requested task before an owning session kills it.
+    /// Delivered terminals are omitted by project replay, but may still name
+    /// a runner job whose outcome is unknown.
+    pub(crate) fn recover_kill_task(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        task_id: &str,
+        project_root: &Path,
+        harness: Option<&str>,
+        scope: Option<&subc_protocol::scope::ScopeStamp>,
+    ) -> Result<(), String> {
+        self.recover_task_if(
+            storage_dir,
+            session_id,
+            task_id,
+            Some(project_root),
+            harness,
+            |metadata| match metadata.scope.as_ref() {
+                None => true,
+                // A newer epoch rebinds the same scope after a restart; it does
+                // not give another scope or an older binding control of the job.
+                Some(saved) => scope.is_some_and(|current| {
+                    current.owner == saved.owner
+                        && current.scope_ref == saved.scope_ref
+                        && current.scope_epoch >= saved.scope_epoch
+                }),
+            },
+        )
+    }
+
+    fn recover_task_if(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        task_id: &str,
+        project_root: Option<&Path>,
+        harness: Option<&str>,
+        accept: impl FnOnce(&PersistedTask) -> bool,
+    ) -> Result<(), String> {
         if validate_task_id(task_id).is_err() || self.task(task_id).is_some() {
             return Ok(());
         }
@@ -6236,6 +6286,7 @@ impl BgTaskRegistry {
                 metadata.project_root.as_deref().map(canonicalized_path)
                     != Some(canonicalized_path(project))
             })
+            || !accept(&metadata)
         {
             return Ok(());
         }

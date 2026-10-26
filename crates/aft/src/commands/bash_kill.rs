@@ -42,6 +42,18 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             {
                 let config = ctx.config();
                 let _ = if let Some(project_root) = config.project_root.as_deref() {
+                    let harness = crate::bash_background::route_harness()
+                        .or_else(|| config.harness.clone())
+                        .map(|harness| harness.storage_segment());
+                    let scope = crate::bash_background::registry::scope_for_spawn();
+                    let _ = ctx.bash_background().recover_kill_task(
+                        &storage_dir,
+                        req.session(),
+                        &task_id,
+                        project_root,
+                        harness.as_deref(),
+                        scope.as_ref(),
+                    );
                     ctx.bash_background().replay_session_for_project(
                         &storage_dir,
                         req.session(),

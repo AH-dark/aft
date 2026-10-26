@@ -4332,6 +4332,231 @@ fn cancel_requests(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde
         .collect()
 }
 
+fn delivered_unknown_restart_fixture(
+    dir: &Path,
+    connection: PathBuf,
+    expired: bool,
+) -> (String, TaskPaths, crate::context::AppContext) {
+    let storage = dir.join("store");
+    let namespace = storage.join("opencode");
+    let project = dir.join("project");
+    fs::create_dir_all(&namespace).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    let (registry, task, paths) =
+        finished_remote_for_cancel(&namespace, connection, cancel_unknown_terminal());
+    registry.detach();
+    drop(registry);
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.project_root = Some(project.clone());
+    metadata.workdir = project.clone();
+    metadata.harness = Some("opencode".into());
+    metadata.scope.as_mut().unwrap().scope_epoch = 9;
+    metadata.completion_delivered = true;
+    if expired {
+        metadata.started_at = 0;
+    }
+    write_task(&paths.json, &metadata).unwrap();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(project.clone()),
+            storage_dir: Some(storage),
+            harness: Some(crate::harness::Harness::Opencode),
+            ..Default::default()
+        },
+    );
+    ctx.bash_background()
+        .set_harness(crate::harness::Harness::Opencode);
+    ctx.bash_background()
+        .replay_session_for_project(&namespace, "session", &project)
+        .unwrap();
+    assert!(
+        !ctx.bash_background().holds_task(&task),
+        "project replay must skip the delivered terminal"
+    );
+    (task, paths, ctx)
+}
+
+async fn kill_restarted_unknown(
+    ctx: crate::context::AppContext,
+    task: String,
+    session: &str,
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+) -> crate::protocol::Response {
+    let request = crate::protocol::RawRequest {
+        id: "restart-unknown-kill".into(),
+        command: "bash_kill".into(),
+        lsp_hints: None,
+        session_id: Some(session.into()),
+        params: serde_json::json!({"task_id": task}),
+    };
+    tokio::task::spawn_blocking(move || {
+        super::super::with_scope_spawn(scope, || crate::commands::bash_kill::handle(&request, &ctx))
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn restart_delivered_unknown_kill_restores_owner_on_newer_epoch() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (task, paths, ctx) =
+        delivered_unknown_restart_fixture(dir.path(), daemon.connection.clone(), false);
+    let before = read_task(&paths.json).unwrap();
+    let mut scope = before.scope.clone().unwrap();
+    scope.scope_epoch += 1;
+    let reply = kill_restarted_unknown(ctx, task, "session", Some(scope)).await;
+    assert!(
+        reply.success,
+        "owning session must recover its scoped delivered task: {reply:?}"
+    );
+    assert_eq!(reply.data["status"], "fate_unknown");
+    assert_eq!(reply.data["remote_cancel"], "runner confirmed cancellation");
+    let requests = cancel_requests(&daemon);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["params"]["job_id"], id().to_string());
+    let after = read_task(&paths.json).unwrap();
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.scope, before.scope);
+    assert_eq!(
+        after.remote.unwrap().terminal,
+        before.remote.unwrap().terminal
+    );
+    assert!(after.completion_delivered);
+}
+
+#[tokio::test]
+async fn restart_delivered_unknown_kill_refuses_other_scope_ref() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (task, _, ctx) =
+        delivered_unknown_restart_fixture(dir.path(), daemon.connection.clone(), false);
+    let mut scope = owner_scope("other-scope");
+    scope.scope_epoch = 10;
+    let reply = kill_restarted_unknown(ctx, task, "session", Some(scope)).await;
+    assert!(
+        !reply.success,
+        "another scope ref must not restore the task: {reply:?}"
+    );
+    assert_eq!(reply.data["code"], "task_not_found");
+    assert!(cancel_requests(&daemon).is_empty());
+}
+
+#[tokio::test]
+async fn restart_delivered_unknown_kill_refuses_lower_epoch() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (task, _, ctx) =
+        delivered_unknown_restart_fixture(dir.path(), daemon.connection.clone(), false);
+    let mut scope = owner_scope("unknown-outcome");
+    scope.scope_epoch = 8;
+    let reply = kill_restarted_unknown(ctx, task, "session", Some(scope)).await;
+    assert!(
+        !reply.success,
+        "an older scope epoch must not restore the task: {reply:?}"
+    );
+    assert_eq!(reply.data["code"], "task_not_found");
+    assert!(cancel_requests(&daemon).is_empty());
+}
+
+#[tokio::test]
+async fn restart_delivered_unknown_kill_refuses_foreign_callers() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let mut other_owner = owner_scope("unknown-outcome");
+    other_owner.scope_epoch = 10;
+    other_owner.owner = subc_protocol::Principal::Reserved {
+        module_id: "other-owner".into(),
+    };
+    let mut owner = owner_scope("unknown-outcome");
+    owner.scope_epoch = 10;
+    for (session, scope) in [
+        ("other-session", Some(owner)),
+        ("session", Some(other_owner)),
+        ("session", None),
+    ] {
+        let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (task, _, ctx) =
+            delivered_unknown_restart_fixture(dir.path(), daemon.connection.clone(), false);
+        let reply = kill_restarted_unknown(ctx, task, session, scope).await;
+        assert!(
+            !reply.success,
+            "foreign caller must not restore the task: {reply:?}"
+        );
+        assert_eq!(reply.data["code"], "task_not_found");
+        assert!(cancel_requests(&daemon).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn restart_delivered_unknown_kill_refuses_other_project_or_harness() {
+    let _storage_env = crate::test_env::without_storage_override();
+    for other_harness in [false, true] {
+        let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (task, paths, ctx) =
+            delivered_unknown_restart_fixture(dir.path(), daemon.connection.clone(), false);
+        if other_harness {
+            ctx.update_config(|config| config.harness = Some(crate::harness::Harness::Pi));
+            ctx.bash_background()
+                .set_harness(crate::harness::Harness::Pi);
+        } else {
+            let other_project = dir.path().join("other-project");
+            fs::create_dir_all(&other_project).unwrap();
+            ctx.update_config(|config| config.project_root = Some(other_project));
+        }
+        let scope = read_task(&paths.json).unwrap().scope;
+        let reply = kill_restarted_unknown(ctx, task, "session", scope).await;
+        assert!(
+            !reply.success,
+            "foreign namespace must not restore the task: {reply:?}"
+        );
+        assert_eq!(reply.data["code"], "task_not_found");
+        assert!(cancel_requests(&daemon).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn restart_delivered_unknown_kill_keeps_unscoped_session_recovery() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (task, paths, ctx) =
+        delivered_unknown_restart_fixture(dir.path(), daemon.connection.clone(), false);
+    let mut metadata = read_task(&paths.json).unwrap();
+    metadata.scope = None;
+    write_task(&paths.json, &metadata).unwrap();
+    let reply = kill_restarted_unknown(ctx, task, "session", None).await;
+    assert!(
+        reply.success,
+        "an unscoped saved task keeps session ownership: {reply:?}"
+    );
+    assert_eq!(reply.data["remote_cancel"], "runner confirmed cancellation");
+    assert_eq!(cancel_requests(&daemon).len(), 1);
+}
+
+#[tokio::test]
+async fn restart_delivered_unknown_kill_past_timeout_keeps_finished_answer() {
+    let _storage_env = crate::test_env::without_storage_override();
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (task, paths, ctx) =
+        delivered_unknown_restart_fixture(dir.path(), daemon.connection.clone(), true);
+    let scope = read_task(&paths.json).unwrap().scope;
+    let reply = kill_restarted_unknown(ctx, task, "session", scope).await;
+    assert!(
+        reply.success,
+        "an expired owned task still has its finished answer: {reply:?}"
+    );
+    assert_eq!(reply.data["status"], "fate_unknown");
+    assert!(reply.data.get("remote_cancel").is_none());
+    assert!(cancel_requests(&daemon).is_empty());
+}
+
 #[tokio::test]
 async fn fate_unknown_bash_kill_cancels_recorded_job_and_reports_runner_answers() {
     for (script, expected) in [
