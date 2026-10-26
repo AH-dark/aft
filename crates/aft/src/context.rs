@@ -16286,6 +16286,8 @@ impl AppContext {
     /// Build a full memory estimate from index walks (fresh or reused) plus
     /// the cheap subsystem estimates, which are always taken fresh.
     fn memory_estimates_from(&self, walked: WalkedMemory) -> [crate::memory::MemoryEstimate; 10] {
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        let mut timer = crate::test_allocations::profile::Timer::new();
         let WalkedMemory {
             mut semantic,
             trigram,
@@ -16331,6 +16333,8 @@ impl AppContext {
                 semantic.not_estimated.push("checkout_overlay_busy".into());
             }
         }
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        timer.mark("memory / live semantic overlay");
         let callgraph = match self.callgraph_store.try_read() {
             Ok(store) => store
                 .as_ref()
@@ -16348,19 +16352,29 @@ impl AppContext {
             Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
         };
         let callgraph_projection = self.inspect_manager.callgraph_projection_estimated_memory();
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        timer.mark("memory / callgraph");
         let inspect = self.inspect_manager.estimated_memory();
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        timer.mark("memory / inspect");
         let bash = self.bash_background.estimated_memory();
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        timer.mark("memory / bash");
         let lsp = self
             .lsp_manager
             .try_lock()
             .map(|lsp| lsp.estimated_memory())
             .unwrap_or_else(crate::memory::MemoryEstimate::busy);
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        timer.mark("memory / lsp");
         // Parsers are created per operation rather than retained in a pool, so
         // parser bytes remain an explicit estimation gap instead of a guess.
         let parser_pool = crate::memory::MemoryEstimate::not_estimated()
             .count("pooled_parsers", 0)
             .gap("tree_sitter_parser_bytes");
         let pending_install = self.pending_install_estimate();
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        timer.mark("memory / parser and pending install");
         [
             semantic,
             trigram,
@@ -16508,6 +16522,8 @@ impl AppContext {
         crate::memory::RootMemorySnapshot,
         crate::memory::RootMemoryRollup,
     ) {
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        let mut timer = crate::test_allocations::profile::Timer::new();
         let semantic_shape = self.semantic_memory_shape();
         let trigram_shape = self.trigram_memory_shape();
         let symbol_shape = self.symbol_memory_shape();
@@ -16566,6 +16582,8 @@ impl AppContext {
         #[cfg(test)]
         let age = now.saturating_duration_since(walked.measured_at);
         let measured_age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        timer.mark("memory / index shape checks and cached estimates");
         let estimates = self.memory_estimates_from(walked);
         let rollup =
             Self::memory_root_rollup_from(&estimates).with_measured_age_ms(measured_age_ms);

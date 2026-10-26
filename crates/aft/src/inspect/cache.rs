@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
@@ -250,12 +250,111 @@ pub struct ContributionRecord {
     pub type_ref_names: BTreeSet<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static AGGREGATE_MEMORY_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static UNCACHED_AGGREGATE_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn aggregate_memory_walks_for_test() -> usize {
+    AGGREGATE_MEMORY_WALKS.with(std::cell::Cell::get)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct AggregateMemoryModeGuard(bool);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for AggregateMemoryModeGuard {
+    fn drop(&mut self) {
+        UNCACHED_AGGREGATE_MEMORY.with(|mode| mode.set(self.0));
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn uncached_aggregate_memory_for_test(uncached: bool) -> AggregateMemoryModeGuard {
+    AggregateMemoryModeGuard(UNCACHED_AGGREGATE_MEMORY.with(|mode| mode.replace(uncached)))
+}
+
 #[derive(Debug, Clone)]
 struct MemoryAggregate {
     touched: u64,
     payload: serde_json::Value,
     generated_at: i64,
     contribution_set_hash: Option<String>,
+}
+
+/// Keep payload mutations and their byte memo under the same map lock. Only
+/// recency touches can preserve the memo: they change neither payload nor size.
+#[derive(Debug, Default)]
+struct MemoryAggregates {
+    entries: HashMap<JobKey, MemoryAggregate>,
+    bytes: AtomicU64,
+    bytes_valid: AtomicBool,
+}
+
+impl std::ops::Deref for MemoryAggregates {
+    type Target = HashMap<JobKey, MemoryAggregate>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl MemoryAggregates {
+    fn insert(&mut self, key: JobKey, aggregate: MemoryAggregate) -> Option<MemoryAggregate> {
+        self.bytes_valid.store(false, Ordering::Relaxed);
+        self.entries.insert(key, aggregate)
+    }
+
+    fn remove(&mut self, key: &JobKey) -> Option<MemoryAggregate> {
+        self.bytes_valid.store(false, Ordering::Relaxed);
+        self.entries.remove(key)
+    }
+
+    fn touch(&mut self, key: &JobKey, clock: &AtomicU64) -> Option<&MemoryAggregate> {
+        let entry = self.entries.get_mut(key)?;
+        entry.touched = clock.fetch_add(1, Ordering::Relaxed);
+        Some(entry)
+    }
+
+    fn estimated_bytes(&self) -> u64 {
+        #[cfg(test)]
+        if UNCACHED_AGGREGATE_MEMORY.with(std::cell::Cell::get) {
+            return self.rebuild_estimated_bytes();
+        }
+        if self.bytes_valid.load(Ordering::Acquire) {
+            return self.bytes.load(Ordering::Relaxed);
+        }
+        // The caller holds a read guard, so concurrent misses see the same map.
+        // Redundant computation avoids making a memory probe wait on another walk.
+        let bytes = self.rebuild_estimated_bytes();
+        self.bytes.store(bytes, Ordering::Relaxed);
+        self.bytes_valid.store(true, Ordering::Release);
+        bytes
+    }
+
+    fn rebuild_estimated_bytes(&self) -> u64 {
+        #[cfg(test)]
+        AGGREGATE_MEMORY_WALKS.with(|walks| walks.set(walks.get() + 1));
+        self.entries.iter().fold(0u64, |bytes, (key, aggregate)| {
+            bytes
+                .saturating_add(std::mem::size_of::<JobKey>() as u64)
+                .saturating_add(
+                    key.scope_hash
+                        .as_ref()
+                        .map_or(0, |hash| crate::memory::usize_to_u64(hash.len())),
+                )
+                .saturating_add(std::mem::size_of::<MemoryAggregate>() as u64)
+                .saturating_add(crate::memory::estimated_json_bytes(&aggregate.payload))
+                .saturating_add(
+                    aggregate
+                        .contribution_set_hash
+                        .as_ref()
+                        .map_or(0, |hash| crate::memory::usize_to_u64(hash.len())),
+                )
+        })
+    }
 }
 
 const TIER1_FILE_MEMO_MAX_ENTRIES: usize = 4_096;
@@ -523,7 +622,7 @@ pub struct InspectCache {
     writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
     read_marker: Option<crate::root_cache::ReadMarker>,
     conn: Mutex<TrackedConnection>,
-    memory: RwLock<HashMap<JobKey, MemoryAggregate>>,
+    memory: RwLock<MemoryAggregates>,
     writer_retry_at: Option<Instant>,
 }
 
@@ -533,6 +632,42 @@ pub struct ReadonlyInspectCache {
 }
 
 impl InspectCache {
+    #[cfg(test)]
+    pub(crate) fn legacy_estimated_memory_for_test(&self) -> crate::memory::MemoryEstimate {
+        let memory = match self.memory.try_read() {
+            Ok(memory) => memory,
+            Err(_) => return crate::memory::MemoryEstimate::busy(),
+        };
+        if memory.is_empty() {
+            return crate::memory::MemoryEstimate::partial(0)
+                .count("memory_aggregates", 0)
+                .count("open_generation_handles", 1);
+        }
+        let bytes = memory.iter().fold(0u64, |bytes, (key, aggregate)| {
+            bytes
+                .saturating_add(std::mem::size_of::<JobKey>() as u64)
+                .saturating_add(
+                    key.scope_hash
+                        .as_ref()
+                        .map_or(0, |hash| crate::memory::usize_to_u64(hash.len())),
+                )
+                .saturating_add(std::mem::size_of::<MemoryAggregate>() as u64)
+                .saturating_add(crate::memory::estimated_json_bytes(&aggregate.payload))
+                .saturating_add(
+                    aggregate
+                        .contribution_set_hash
+                        .as_ref()
+                        .map_or(0, |hash| crate::memory::usize_to_u64(hash.len())),
+                )
+        });
+        let metadata = crate::memory::path_bytes(&self.project_root)
+            .saturating_add(crate::memory::usize_to_u64(self.project_key.len()))
+            .saturating_add(crate::memory::path_bytes(&self.sqlite_path));
+        crate::memory::MemoryEstimate::partial(bytes.saturating_add(metadata))
+            .count("memory_aggregates", memory.len())
+            .count("open_generation_handles", 1)
+    }
+
     /// Estimate only the in-process aggregate map. SQLite-owned allocations are
     /// measured once by the process-wide SQLite allocator counters.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
@@ -545,25 +680,7 @@ impl InspectCache {
                 .count("memory_aggregates", 0)
                 .count("open_generation_handles", 1);
         }
-        let aggregate_bytes = memory.iter().fold(0u64, |bytes, (key, aggregate)| {
-            bytes
-                .saturating_add(std::mem::size_of::<JobKey>() as u64)
-                .saturating_add(
-                    key.scope_hash
-                        .as_ref()
-                        .map(|hash| crate::memory::usize_to_u64(hash.len()))
-                        .unwrap_or(0),
-                )
-                .saturating_add(std::mem::size_of::<MemoryAggregate>() as u64)
-                .saturating_add(crate::memory::estimated_json_bytes(&aggregate.payload))
-                .saturating_add(
-                    aggregate
-                        .contribution_set_hash
-                        .as_ref()
-                        .map(|hash| crate::memory::usize_to_u64(hash.len()))
-                        .unwrap_or(0),
-                )
-        });
+        let aggregate_bytes = memory.estimated_bytes();
         let metadata_bytes = crate::memory::path_bytes(&self.project_root)
             .saturating_add(crate::memory::usize_to_u64(self.project_key.len()))
             .saturating_add(crate::memory::path_bytes(&self.sqlite_path));
@@ -738,7 +855,7 @@ impl InspectCache {
             writer_lease,
             read_marker,
             conn: Mutex::new(conn),
-            memory: RwLock::new(HashMap::new()),
+            memory: RwLock::new(MemoryAggregates::default()),
             writer_retry_at: None,
         }
     }
@@ -878,11 +995,8 @@ impl InspectCache {
                 .memory
                 .write()
                 .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
-                .get_mut(key)
-                .map(|entry| {
-                    entry.touched = self.memory_clock.fetch_add(1, Ordering::Relaxed);
-                    entry.payload.clone()
-                }));
+                .touch(key, &self.memory_clock)
+                .map(|entry| entry.payload.clone()));
         }
 
         let current_hash = {
@@ -4275,6 +4389,120 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod memory_estimate_tests {
     use super::*;
+
+    fn seeded_tier2_cache() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        InspectCache,
+        Config,
+        JobKey,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let project_root = std::fs::canonicalize(root.path()).unwrap();
+        let file = project_root.join("src.rs");
+        std::fs::write(&file, "fn fixture() {}\n").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let cache = InspectCache::open(storage.path().to_path_buf(), project_root).unwrap();
+        let category = InspectCategory::Complexity;
+        let config = Config::default();
+        let key = JobKey::for_project_category(category);
+        let contribution = FileContribution::new(
+            category,
+            file.clone(),
+            crate::cache_freshness::collect(&file).unwrap(),
+            serde_json::json!({"file": "src.rs"}),
+        );
+        cache
+            .store_tier2_result_for_config(
+                key.clone(),
+                std::slice::from_ref(&file),
+                &[contribution],
+                serde_json::json!({"count": 1}),
+                &config,
+            )
+            .unwrap();
+        cache
+            .store_aggregated(
+                JobKey::for_project_category(InspectCategory::Todos),
+                serde_json::json!({"items": ["retained independently"]}),
+            )
+            .unwrap();
+        (root, storage, cache, config, key)
+    }
+
+    #[test]
+    fn inspect_memory_hash_mismatch_removal_matches_legacy() {
+        let (_root, _storage, cache, config, key) = seeded_tier2_cache();
+        let category = key.category;
+        let old_hash = cache
+            .contribution_set_hash_for_config(category, &config)
+            .unwrap();
+        assert_eq!(cache.estimated_memory().counts["memory_aggregates"], 2);
+        cache
+            .delete_tier2_contribution(category, Path::new("src.rs"))
+            .unwrap();
+        assert_ne!(
+            old_hash,
+            cache
+                .contribution_set_hash_for_config(category, &config)
+                .unwrap()
+        );
+        assert_eq!(
+            cache.get_aggregated_for_config(&key, &config).unwrap(),
+            None
+        );
+        assert_eq!(cache.estimated_memory().counts["memory_aggregates"], 1);
+        assert_eq!(
+            cache.estimated_memory(),
+            cache.legacy_estimated_memory_for_test()
+        );
+    }
+
+    #[test]
+    fn inspect_memory_committed_update_removal_matches_legacy() {
+        let (_root, _storage, cache, config, key) = seeded_tier2_cache();
+        let category = key.category;
+        assert_eq!(cache.estimated_memory().counts["memory_aggregates"], 2);
+        cache
+            .apply_contribution_updates_with_config(
+                category,
+                Tier2ContributionUpdates {
+                    deletes: vec![PathBuf::from("src.rs")],
+                    ..Default::default()
+                },
+                Some(&config),
+            )
+            .unwrap();
+        assert!(cache.load_tier2_contributions(category).unwrap().is_empty());
+        assert_eq!(cache.estimated_memory().counts["memory_aggregates"], 1);
+        assert_eq!(
+            cache.estimated_memory(),
+            cache.legacy_estimated_memory_for_test()
+        );
+    }
+
+    #[test]
+    fn inspect_memory_cached_bytes_do_not_hide_busy_or_poison() {
+        let (_root, _storage, cache, _config, _key) = seeded_tier2_cache();
+        assert!(cache.estimated_memory().estimated_bytes.unwrap() > 0);
+        {
+            let _held = cache.memory.write().unwrap();
+            assert_eq!(cache.estimated_memory().status, "busy");
+        }
+        assert_eq!(
+            cache.estimated_memory(),
+            cache.legacy_estimated_memory_for_test()
+        );
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = cache.memory.write().unwrap();
+            panic!("poison the memory map");
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(
+            cache.estimated_memory(),
+            crate::memory::MemoryEstimate::busy()
+        );
+    }
 
     #[test]
     fn inspect_memory_estimate_is_zero_when_empty_and_nonzero_when_populated() {

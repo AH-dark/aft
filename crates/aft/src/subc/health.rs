@@ -6731,6 +6731,209 @@ mod tests {
         assert_eq!(walks(), after_first + 2);
     }
 
+    #[test]
+    fn quiet_rollup_does_not_rebuild_inspect_memory_payloads() {
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let cache = HealthRollupCache::new();
+        let storage = tempfile::tempdir().unwrap();
+        let mut dirs = Vec::new();
+        for index in 0..200 {
+            let (dir, root) = test_root(&format!("quiet-memory-payload-{index}"));
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    project_root: Some(root.as_path().to_path_buf()),
+                    ..crate::config::Config::default()
+                },
+            ));
+            let inspect = ctx
+                .inspect_manager()
+                .cache_for_paths(ctx.inspect_dir(), root.as_path().to_path_buf())
+                .unwrap();
+            let scope = crate::inspect::JobScope::for_project(root.as_path().to_path_buf());
+            let key = crate::inspect::JobKey::for_category_scope(
+                crate::inspect::InspectCategory::Diagnostics,
+                &scope,
+            );
+            inspect
+                .store_aggregated(
+                    key,
+                    json!({"items": [{"message": format!("warning {index}")}]}),
+                )
+                .unwrap();
+            assert!(executor.register_actor(root, ctx));
+            dirs.push(dir);
+        }
+        let now = Instant::now();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        crate::context::with_memory_walk_clock_for_test(now, || {
+            cache.refresh_for_test(&executor, &app);
+        });
+        let before = crate::inspect::cache::aggregate_memory_walks_for_test();
+        cache.clock_ms.store(3_000, Ordering::Relaxed);
+        crate::context::with_memory_walk_clock_for_test(now + Duration::from_secs(3), || {
+            cache.refresh_for_test(&executor, &app);
+        });
+        assert_eq!(
+            crate::inspect::cache::aggregate_memory_walks_for_test() - before,
+            0,
+            "a quiet 200-root tick rebuilt retained inspect payload estimates",
+        );
+        let (root, ctx) = executor.actor_entries().into_iter().next().unwrap();
+        let inspect = ctx
+            .inspect_manager()
+            .cache_for_paths(ctx.inspect_dir(), root.as_path().to_path_buf())
+            .unwrap();
+        let scope = crate::inspect::JobScope::for_project(root.as_path().to_path_buf());
+        let key = crate::inspect::JobKey::for_category_scope(
+            crate::inspect::InspectCategory::Diagnostics,
+            &scope,
+        );
+        inspect
+            .store_aggregated(
+                key,
+                json!({"items": [{"message": "a changed diagnostic with a longer message"}]}),
+            )
+            .unwrap();
+        let before = crate::inspect::cache::aggregate_memory_walks_for_test();
+        cache.clock_ms.store(6_000, Ordering::Relaxed);
+        crate::context::with_memory_walk_clock_for_test(now + Duration::from_secs(6), || {
+            cache.refresh_for_test(&executor, &app);
+        });
+        assert_eq!(
+            crate::inspect::cache::aggregate_memory_walks_for_test() - before,
+            1,
+            "only the changed root may rebuild its inspect estimate"
+        );
+        let label = root.as_path().display().to_string();
+        let snapshot = cache.snapshot().0;
+        assert!(snapshot.metrics["memory"]["roots"]
+            .as_object()
+            .unwrap()
+            .contains_key(&label));
+        assert!(snapshot.metrics["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["project_root"] == label));
+    }
+
+    #[test]
+    fn inspect_memory_rollup_json_matches_legacy_under_churn() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let inspect = crate::inspect::InspectCache::open(
+            storage.path().to_path_buf(),
+            root.path().to_path_buf(),
+        )
+        .unwrap();
+        let peers = (0..2)
+            .map(|index| {
+                let cache = crate::inspect::InspectCache::open(
+                    storage.path().join(format!("peer-{index}")),
+                    root.path().to_path_buf(),
+                )
+                .unwrap();
+                cache
+                    .store_aggregated(
+                        crate::inspect::JobKey::for_project_category(
+                            crate::inspect::InspectCategory::Todos,
+                        ),
+                        json!({"items": ["fixed peer diagnostic".repeat(30 * (index + 1))]}),
+                    )
+                    .unwrap();
+                cache
+            })
+            .collect::<Vec<_>>();
+        let assert_parity = || {
+            let caches = std::iter::once(&inspect).chain(peers.iter());
+            let legacy = caches
+                .clone()
+                .map(|cache| cache.legacy_estimated_memory_for_test())
+                .collect::<Vec<_>>();
+            let current = caches
+                .map(|cache| cache.estimated_memory())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                serde_json::to_vec(&current).unwrap(),
+                serde_json::to_vec(&legacy).unwrap()
+            );
+            let shared = crate::memory::SharedProcessMemory::measure();
+            let allocator = crate::memory::AllocatorObservation::measure();
+            let build = |estimates: &[crate::memory::MemoryEstimate]| {
+                let roots = (0..200usize)
+                    .map(|index| {
+                        let other = crate::memory::MemoryEstimate::estimated(index as u64 * 100);
+                        let row = crate::memory::RootMemoryRollup::from_estimates(&[
+                            &estimates[index % estimates.len()],
+                            &other,
+                        ])
+                        .with_measured_age_ms(3_000);
+                        let row = if index % 3 == 0 {
+                            row.with_standing()
+                        } else {
+                            row
+                        };
+                        (format!("/parity/root-{index:03}"), row)
+                    })
+                    .collect();
+                crate::memory::MemoryRollupSnapshot::with_shared(
+                    "ready",
+                    roots,
+                    allocator.clone(),
+                    &shared,
+                )
+            };
+            let expected = build(&legacy);
+            let mut actual = build(&current);
+            let root_and_shared = |process: &crate::memory::ProcessMemorySnapshot| {
+                process.total_attributed_bytes
+                    - process.sqlite.memory_used_bytes
+                    - process.embedding_model_bytes
+            };
+            assert_eq!(
+                root_and_shared(&actual.process),
+                root_and_shared(&expected.process)
+            );
+            assert_eq!(actual.process.root_count, expected.process.root_count);
+            assert_eq!(
+                actual.process.busy_subsystems,
+                expected.process.busy_subsystems
+            );
+            assert_eq!(
+                actual.process.not_estimated_subsystems,
+                expected.process.not_estimated_subsystems
+            );
+            // Process counters can change between constructors. Their root-derived
+            // totals were checked above; use one observation for the wire comparison.
+            actual.process = expected.process.clone();
+            assert_eq!(
+                serde_json::to_vec(&memory_rollup_metrics(Some(actual))).unwrap(),
+                serde_json::to_vec(&memory_rollup_metrics(Some(expected))).unwrap(),
+            );
+        };
+        assert_parity();
+        let project =
+            crate::inspect::JobKey::for_project_category(crate::inspect::InspectCategory::Todos);
+        for revision in 0..140 {
+            inspect.store_aggregated(project.clone(), json!({"items": [{"message": "warning".repeat(revision + 1), "revision": revision}]})).unwrap();
+            inspect
+                .store_aggregated(
+                    crate::inspect::JobKey {
+                        category: crate::inspect::InspectCategory::Todos,
+                        scope_hash: Some(format!("scope-{revision}")),
+                    },
+                    json!({"nested": [{"unicode": "λ", "values": [null, false, revision]}]}),
+                )
+                .unwrap();
+            assert_parity();
+            inspect.get_aggregated(&project).unwrap().unwrap();
+            assert_parity();
+        }
+    }
+
     /// What a rollup costs while nothing changes, counted rather than timed:
     /// it walks no arena runs and no root index, and it measures no memory
     /// census, however many roots and resident chunks there are. The compact
