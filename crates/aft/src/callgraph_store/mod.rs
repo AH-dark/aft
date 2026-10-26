@@ -4008,7 +4008,7 @@ struct RefreshWorkerTestSeam {
     #[cfg(test)]
     open_failure_replay_hold: Option<TestHold>,
     #[cfg(test)]
-    open_lock_hold: Option<TestHold>,
+    open_lock_hold: Option<RefreshOpenLockHold>,
     /// Makes the writer lease look held by another live process, so a
     /// waiting batch stays waiting without a second process.
     #[cfg(test)]
@@ -4041,22 +4041,44 @@ struct TestHold {
 }
 
 #[cfg(test)]
-pub(crate) fn hold_refresh_open_lock_for_test(
-    project_root: PathBuf,
-) -> (
-    crossbeam_channel::Receiver<()>,
-    crossbeam_channel::Sender<()>,
-) {
+#[derive(Clone)]
+struct RefreshOpenLockHold {
+    lock: TestHold,
+    unlocked: crossbeam_channel::Sender<()>,
+    read_done: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct RefreshOpenLockTestGate {
+    pub held: crossbeam_channel::Receiver<()>,
+    pub release: crossbeam_channel::Sender<()>,
+    pub unlocked: crossbeam_channel::Receiver<()>,
+    pub read_done: crossbeam_channel::Sender<()>,
+}
+
+#[cfg(test)]
+pub(crate) fn hold_refresh_open_lock_for_test(project_root: PathBuf) -> RefreshOpenLockTestGate {
     let (held, held_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release) = crossbeam_channel::bounded(1);
+    let (unlocked_tx, unlocked) = crossbeam_channel::bounded(1);
+    let (read_done, read_done_rx) = crossbeam_channel::bounded(1);
     REFRESH_WORKER_TEST_SEAMS
         .get_or_init(Default::default)
         .lock()
         .unwrap()
         .entry(project_root)
         .or_default()
-        .open_lock_hold = Some(TestHold { held, release });
-    (held_rx, release_tx)
+        .open_lock_hold = Some(RefreshOpenLockHold {
+        lock: TestHold { held, release },
+        unlocked: unlocked_tx,
+        read_done: read_done_rx,
+    });
+    RefreshOpenLockTestGate {
+        held: held_rx,
+        release: release_tx,
+        unlocked,
+        read_done,
+    }
 }
 
 #[cfg(test)]
@@ -4072,11 +4094,65 @@ fn hold_refresh_connection_lock_for_test(project_root: &Path, conn: &TrackedConn
         // Lengthen the exclusive-lock window of a rollback-journal writer open
         // on the actual refresh connection, before it switches the file to WAL.
         conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        hold.held.send(()).unwrap();
+        hold.lock.held.send(()).unwrap();
         // If the test panics, dropping its sender unblocks this receive so the
         // refresh connection still rolls back and releases its SQLite lock.
-        let _ = hold.release.recv();
+        let _ = hold.lock.release.recv();
         conn.execute_batch("ROLLBACK").unwrap();
+        // Let the busy callback retry call_tree before this connection enters
+        // configure_generation_connection's WAL switch. The test drops its
+        // read_done sender after the query; dropping the release or read_done
+        // sender on panic also disconnects the corresponding receive.
+        let _ = hold.unlocked.send(());
+        let _ = hold.read_done.recv();
+    }
+}
+
+#[cfg(test)]
+struct ServingBusyObserver {
+    on_busy: Option<Box<dyn FnOnce(Duration) -> bool>>,
+    timeout: Duration,
+    observed: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SERVING_BUSY_OBSERVER: std::cell::RefCell<Option<ServingBusyObserver>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_serving_busy_retry_for_test(_attempt: i32) -> bool {
+    SERVING_BUSY_OBSERVER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(observer) = slot.as_mut() else {
+            return false;
+        };
+        observer.observed = true;
+        observer
+            .on_busy
+            .take()
+            .is_some_and(|on_busy| on_busy(observer.timeout))
+    })
+}
+
+#[cfg(test)]
+struct ServingBusyObserverGuard<'a> {
+    conn: &'a Mutex<TrackedConnection>,
+    timeout: Duration,
+}
+
+#[cfg(test)]
+impl Drop for ServingBusyObserverGuard<'_> {
+    fn drop(&mut self) {
+        let restored = self
+            .conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .busy_timeout(self.timeout);
+        SERVING_BUSY_OBSERVER.with(|slot| slot.borrow_mut().take());
+        if !std::thread::panicking() {
+            restored.unwrap();
+        }
     }
 }
 
@@ -8958,6 +9034,45 @@ impl CallGraphStore {
 }
 
 impl ReadonlyCallGraphStore {
+    #[cfg(test)]
+    pub(crate) fn with_busy_observer_for_test<R>(
+        &self,
+        on_busy: impl FnOnce(Duration) -> bool + 'static,
+        read: impl FnOnce() -> R,
+    ) -> (R, bool) {
+        let conn = self.inner.conn.lock().unwrap();
+        let timeout_ms: u64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        let timeout = Duration::from_millis(timeout_ms);
+        SERVING_BUSY_OBSERVER.with(|slot| {
+            assert!(slot.borrow().is_none(), "nested serving busy observer");
+            *slot.borrow_mut() = Some(ServingBusyObserver {
+                on_busy: Some(Box::new(on_busy)),
+                timeout,
+                observed: false,
+            });
+        });
+        // The callback runs synchronously on the querying thread. Only replace
+        // a policy that permits waiting: a zero-timeout reader must still fail
+        // under the held lock rather than gain a retry from the test hook.
+        let installed = if !timeout.is_zero() {
+            conn.busy_handler(Some(observe_serving_busy_retry_for_test))
+        } else {
+            Ok(())
+        };
+        drop(conn);
+        let guard = ServingBusyObserverGuard {
+            conn: &self.inner.conn,
+            timeout,
+        };
+        installed.unwrap();
+        let result = read();
+        let observed = SERVING_BUSY_OBSERVER.with(|slot| slot.borrow().as_ref().unwrap().observed);
+        drop(guard);
+        (result, observed)
+    }
+
     /// Read one answer snapshot while this reader retains the generation pins.
     pub(crate) fn read_snapshot(&self) -> Result<CallGraphStore> {
         self.inner.read_snapshot()

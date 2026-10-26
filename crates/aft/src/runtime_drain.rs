@@ -6410,10 +6410,14 @@ mod tests {
         drain_callgraph_store_events(&ctx);
         assert!(ctx.callgraph_store_rx().lock().is_some());
         blocker.execute_batch("ROLLBACK").unwrap();
-        let (refresh_locked, release_refresh) =
-            crate::callgraph_store::hold_refresh_open_lock_for_test(
-                ctx.callgraph_project_root().unwrap(),
-            );
+        let crate::callgraph_store::RefreshOpenLockTestGate {
+            held: refresh_locked,
+            release: release_refresh,
+            unlocked: refresh_unlocked,
+            read_done,
+        } = crate::callgraph_store::hold_refresh_open_lock_for_test(
+            ctx.callgraph_project_root().unwrap(),
+        );
         drain_callgraph_store_events(&ctx);
         assert!(ctx.callgraph_store_rx().lock().is_none());
         assert!(ctx.callgraph_store().read().unwrap().is_some());
@@ -6421,24 +6425,21 @@ mod tests {
         refresh_locked
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
-        // Keep the refresh connection's exclusive lock through the first read.
-        // An early error releases the worker too, so a failing assertion cannot
-        // leave the shared refresh worker parked for the rest of the suite.
-        let (read_done, read_finished) = crossbeam_channel::bounded(1);
-        let release = std::thread::spawn(move || {
-            let early = read_finished.recv_timeout(Duration::from_millis(25));
-            release_refresh.send(()).unwrap();
-            early
-        });
         let resident = ctx.callgraph_store().read().unwrap();
-        let tree = resident
-            .as_ref()
-            .unwrap()
-            .call_tree(Path::new("main.rs"), "entry", 1);
-        let _ = read_done.send(());
-        let released = release.join().unwrap();
+        let store = resident.as_ref().unwrap();
+        // Only SQLite observing the held lock can release the writer. The
+        // callback waits for ROLLBACK before allowing the query to retry, so a
+        // delayed test thread cannot miss contention and pass without a wait.
+        let (tree, busy_observed) = store.with_busy_observer_for_test(
+            move |timeout| {
+                release_refresh.send(()).is_ok() && refresh_unlocked.recv_timeout(timeout).is_ok()
+            },
+            || store.call_tree(Path::new("main.rs"), "entry", 1),
+        );
+        // Dropping the endpoint also frees the worker on an error or panic.
+        drop(read_done);
         let tree = tree.unwrap();
-        assert!(released.is_err(), "the read must wait for the refresh lock");
+        assert!(busy_observed, "SQLite must observe the refresh lock");
         assert_eq!(tree.children[0].name, "leaf");
         crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(
             &ctx.callgraph_project_root().unwrap(),
