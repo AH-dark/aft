@@ -927,6 +927,135 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bash_permissions_roundtrip_readonly_corpus_in_worktree() {
+        use crate::access_policy::{AccessOperation, GrantKind};
+        use crate::bash_permissions::{scan::scan_with_project_root, PermissionKind};
+
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let project = fixture.path().join("project");
+        let worktree = project.join("worker");
+        let source = fixture.path().join("specimens/two-pass-private-20261025");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SHA256SUMS"), "").unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args([
+                    "-c",
+                    "user.name=AFT test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["commit", "--allow-empty", "-m", "fixture"]);
+        git(&["worktree", "add", "--detach", worktree.to_str().unwrap()]);
+        assert!(worktree.join(".git").is_file());
+        assert!(std::fs::canonicalize(&worktree)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(&project).unwrap()));
+
+        // Keep the variable directory changes and nested status pipeline while
+        // using a literal fixture source instead of the user's private corpus.
+        let copy = format!("cp -R '{}/.' $W/corpus-readonly/", source.display());
+        let command = format!(
+            "W='{}'; mkdir -p $W/corpus-readonly && {copy} && chmod -R a-w $W/corpus-readonly && cd $W/corpus-readonly && shasum -a 256 -c SHA256SUMS --quiet && echo ok; cd $W && echo \"status lines: $(git status --short | wc -l)\"",
+            worktree.display(),
+        );
+        let first = scan_with_project_root(&command, &project, &project);
+        let canonical_source = std::fs::canonicalize(&source).unwrap();
+        assert!(!canonical_source.starts_with(std::fs::canonicalize(&project).unwrap()));
+        let source_pattern = format!("{}/*", canonical_source.display());
+        assert!(
+            first
+                .iter()
+                .any(|ask| ask.kind == PermissionKind::ExternalDirectory
+                    && ask.patterns == [source_pattern.as_str()]
+                    && ask.always == [source_pattern.as_str()]
+                    && ask
+                        .targets
+                        .iter()
+                        .any(|target| target.path == canonical_source
+                            && target.kind == GrantKind::Subtree
+                            && target.operation == AccessOperation::Read
+                            && target.covers(
+                                AccessOperation::Read,
+                                &canonical_source.join("SHA256SUMS")
+                            ))),
+            "the copy source must have an external-directory read ask: {first:?}"
+        );
+        for resource in [
+            "mkdir -p $W/corpus-readonly",
+            copy.as_str(),
+            "chmod -R a-w $W/corpus-readonly",
+            "shasum -a 256 -c SHA256SUMS --quiet",
+            "echo ok",
+            "echo \"status lines: $(git status --short | wc -l)\"",
+            "git status --short",
+            "wc -l",
+        ] {
+            assert!(
+                first.iter().any(|ask| ask.kind == PermissionKind::Bash
+                    && ask.patterns == [resource]
+                    && ask.reason.is_none()),
+                "individual command resource missing: {resource}; asks={first:?}"
+            );
+        }
+        assert!(first.iter().any(|ask| ask.kind == PermissionKind::Bash
+            && ask.patterns == [command.as_str()]
+            && ask.always.is_empty()
+            && ask.reason.as_deref()
+                == Some(crate::bash_permissions::scan::UNKNOWN_CWD_PERMISSION_REASON)));
+
+        for prefer_always in [false, true] {
+            let mut grants = Vec::new();
+            let mut retry = first.clone();
+            let mut rounds = 0;
+            while !permissions_granted_cover(&retry, &grants) {
+                assert!(
+                    rounds < 2,
+                    "permission retry did not settle: {retry:?}; grants={grants:?}"
+                );
+                for ask in &retry {
+                    let approved = if prefer_always && !ask.always.is_empty() {
+                        &ask.always
+                    } else {
+                        &ask.patterns
+                    };
+                    for grant in approved {
+                        if !grants.contains(grant) {
+                            grants.push(grant.clone());
+                        }
+                    }
+                }
+                rounds += 1;
+                retry = scan_with_project_root(&command, &project, &project);
+            }
+            assert_eq!(rounds, 1, "the approved set must cover the first retry");
+            assert!(permissions_granted_cover(&retry, &grants));
+        }
+    }
+
     #[test]
     fn external_approval_coverage_respects_path_and_kind() {
         use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
