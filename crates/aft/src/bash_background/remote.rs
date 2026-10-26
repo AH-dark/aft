@@ -836,7 +836,10 @@ impl KeyedSubmission {
                 submitted_at.saturating_add(
                     metadata
                         .timeout_ms
-                        .unwrap_or(duration_ms(DEFAULT_BG_TIMEOUT)),
+                        .unwrap_or(duration_ms(DEFAULT_BG_TIMEOUT))
+                        // Admission can wait before execution starts; that wait
+                        // does not consume the runner's execution timeout.
+                        .saturating_add(duration_ms(RUNNER_QUEUE_WAIT_LIMIT)),
                 ),
             )
     }

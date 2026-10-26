@@ -12080,13 +12080,14 @@ async fn submission_key_recovery_attempts_are_bounded() {
 }
 
 #[tokio::test]
-async fn submission_key_closed_run_timeout_is_not_resubmitted() {
+async fn submission_key_closed_runner_time_budget_is_not_resubmitted() {
     let daemon = submission_daemon(false, false, false, 2).await;
     let dir = tempfile::tempdir().unwrap();
     let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
     let task = old.task(&task_id).unwrap();
     let mut saved = read_task(&task.paths.json).unwrap();
-    saved.started_at = unix_millis() - saved.timeout_ms.unwrap() - 1;
+    saved.started_at =
+        unix_millis() - saved.timeout_ms.unwrap() - duration_ms(RUNNER_QUEUE_WAIT_LIMIT) - 1;
     write_task(&task.paths.json, &saved).unwrap();
     drop(task);
     drop(old);
@@ -12176,4 +12177,31 @@ async fn submission_key_restart_before_acceptance_replays_from_beginning() {
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[1]["submission_key"], runs[0]["submission_key"]);
     assert!(runs[1].get("resume_from_seq").is_none());
+}
+
+#[tokio::test]
+async fn submission_key_queue_wait_does_not_consume_execution_timeout() {
+    let daemon = submission_daemon(false, false, false, 2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (old, task_id) = stopped_submission(dir.path(), &daemon).await;
+    let task = old.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    saved.started_at = unix_millis() - saved.timeout_ms.unwrap() - 1;
+    let remote = saved.remote.as_mut().unwrap();
+    remote.submission.as_mut().unwrap().created_at_ms = saved.started_at;
+    // Recover the checkpoint from admission, before any execution was observed.
+    remote.last_seq = None;
+    remote.stdout_len = 0;
+    remote.output_received = false;
+    remote.terminal = None;
+    write_task(&task.paths.json, &saved).unwrap();
+    drop(task);
+    drop(old);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(
+        terminal(&restarted, &task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
+    assert_eq!(submission_runs(&daemon).len(), 2);
 }
