@@ -381,8 +381,8 @@ fn remote_execution_note(remote: &RemoteTask) -> String {
 /// Local fallback has its own warnings and never uses this advice.
 ///
 /// The runner has no operation an agent can call to fetch a job AFT stopped
-/// following, so the advice names the job and what to do instead: wait for it
-/// to end by its own run timeout, then rerun.
+/// following, so the advice names the job and how to stop it or wait for its
+/// run timeout before rerunning.
 #[cfg(unix)]
 fn remote_unknown_outcome(
     job_id: Option<Uuid>,
@@ -406,7 +406,7 @@ fn remote_unknown_outcome(
             |ms| format!("for up to its run timeout of {}", retry_duration(ms)),
         );
         text.push_str(&format!(
-            "; job {job_id} may still be running on {RUNNER_ID} and holding this workspace {limit}, and AFT can no longer fetch its result: a rerun in this workspace waits behind it and can be refused with queue_wait_exceeded, so wait for it to end, then rerun"
+            "; job {job_id} may still be running on {RUNNER_ID} and holding this workspace {limit}, and AFT can no longer fetch its result: a rerun in this workspace waits behind it and can be refused with queue_wait_exceeded, so wait for it to end or cancel it with bash_kill, then rerun"
         ));
     }
     text
@@ -3448,6 +3448,37 @@ impl BgTaskRegistry {
     }
 
     pub(super) fn kill_remote_task(&self, task: &Arc<BgTask>) -> Result<BgTaskSnapshot, String> {
+        let metadata = task
+            .lock_state()
+            .map_err(|_| "task lock poisoned")?
+            .metadata
+            .clone();
+        if let Some(job_id) = unknown_remote_cancel_job(&metadata) {
+            // The original follower has stopped. Probe cancellation separately,
+            // without replacing its saved unknown outcome with an acknowledgement.
+            let bound = remote_kill_settle_bound().min(ReattachBudget::until_job_end(&metadata).0);
+            let result = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| error.to_string())?;
+                        runtime.block_on(async {
+                            tokio::time::timeout(bound, cancel_unknown_remote(&metadata, job_id))
+                                .await
+                                .map_err(|_| "runner confirmation timed out".to_string())?
+                        })
+                    })
+                    .join()
+            })
+            .unwrap_or_else(|_| Err("runner cancellation probe stopped".into()));
+            let mut snapshot = self.snapshot_with_terminal_cache(task, 8 * 1024);
+            snapshot.remote_cancel = Some(result.unwrap_or_else(|error| {
+                format!("remote cancellation unconfirmed; outcome is still unknown: {error}")
+            }));
+            return Ok(snapshot);
+        }
         if !self.record_remote_cancel(task)? {
             return self.kill(&task.task_id, &task.session_id);
         }
@@ -3570,6 +3601,114 @@ impl BgTaskRegistry {
             self.remote_terminal(task, Verdict::Cancelled, None);
         }
         true
+    }
+}
+
+/// A locally terminal unknown outcome is not proof that the runner stopped.
+/// Use the latest submission's queue/run bounds only to limit cancellation
+/// attempts, never as evidence of a known outcome.
+#[cfg(unix)]
+pub(super) fn unknown_remote_cancel_job(metadata: &PersistedTask) -> Option<Uuid> {
+    if metadata.status != super::BgTaskStatus::FateUnknown
+        || ReattachBudget::until_job_end(metadata).0.is_zero()
+    {
+        return None;
+    }
+    let remote = metadata.remote.as_ref()?;
+    if remote
+        .terminal
+        .as_ref()
+        .is_some_and(|terminal| terminal.execution_ended())
+    {
+        return None;
+    }
+    remote
+        .job_id
+        .or_else(|| remote.terminal.as_ref().map(|terminal| terminal.job_id))
+}
+
+/// Collects a new runner terminal record without modifying the finished task's artifacts.
+#[cfg(unix)]
+#[derive(Default)]
+struct CancelProbe {
+    terminal: Option<TerminalRecord>,
+}
+
+#[cfg(unix)]
+impl OutputSink for CancelProbe {
+    fn accepted(&mut self, _: &Accepted) -> io::Result<()> {
+        Ok(())
+    }
+    fn output(&mut self, _: u64, _: OutputStream, _: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+    fn truncated(&mut self, _: u64) -> io::Result<()> {
+        Ok(())
+    }
+    fn unknown_output(&mut self, _: u64, _: &[u8]) -> io::Result<()> {
+        Ok(())
+    }
+    fn gap_recovery(&mut self, recovery: &exec::GapRecovery) -> io::Result<()> {
+        self.terminal = Some(recovery.terminal.clone());
+        Ok(())
+    }
+    fn terminal(&mut self, record: &TerminalRecord, _: &Verdict) -> io::Result<()> {
+        self.terminal = Some(record.clone());
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+async fn cancel_unknown_remote(metadata: &PersistedTask, job_id: Uuid) -> Result<String, String> {
+    let remote = metadata
+        .remote
+        .as_ref()
+        .ok_or("remote metadata unavailable")?;
+    let connection = remote
+        .connection_file
+        .as_ref()
+        .ok_or("no runner connection was saved")?;
+    let root = metadata.project_root.as_deref().unwrap_or(Path::new("/"));
+    let client = ExecRemoteClient::connect(
+        connection,
+        subc_protocol::BindIdentity::new(
+            root.display().to_string(),
+            remote.harness.clone(),
+            remote.session.clone(),
+        ),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    client
+        .cancel_job(job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    // A cancel reply only acknowledges intent. Do not reuse a terminal record
+    // from gap recovery: the attach after cancellation must observe a new result.
+    let mut stream = client
+        .attach(ResumePoint {
+            job_id,
+            last_seq: remote.last_seq,
+            gap_recovery: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut probe = CancelProbe::default();
+    loop {
+        let progress = stream.next(&mut probe).await;
+        if let Some(terminal) = probe.terminal.as_ref() {
+            return Ok(match exec::grade(terminal) {
+                Verdict::Cancelled | Verdict::CancelKilled => "runner confirmed cancellation",
+                Verdict::Exited { .. }
+                | Verdict::Signalled { .. }
+                | Verdict::DeadlineKilled
+                | Verdict::RunLocally { .. } => "runner reports job already ended",
+                _ if terminal.execution_ended() => "runner reports job already ended",
+                _ => "remote cancellation requested; outcome is still unknown",
+            }
+            .into());
+        }
+        progress.map_err(|error| error.to_string())?;
     }
 }
 

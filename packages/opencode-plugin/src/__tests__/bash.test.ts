@@ -2433,6 +2433,22 @@ describe("bash_status tool", () => {
     );
   });
 
+  test("bash_kill reports the runner answer without claiming a known task outcome", async () => {
+    for (const remote_cancel of [
+      "runner confirmed cancellation",
+      "runner reports job already ended",
+      "remote cancellation unconfirmed; outcome is still unknown: runner unavailable",
+    ]) {
+      const { killTool } = makeCtx(() => ({
+        success: true,
+        status: "fate_unknown",
+        remote_cancel,
+      }));
+      const result = await killTool.execute({ taskId: "bash-unknown" }, createMockSdkContext());
+      expect(result).toBe(`Task bash-unknown: fate_unknown · ${remote_cancel}`);
+    }
+  });
+
   // ─── sync-watch user-message abort ───
   test("bash_watch sync wait aborts on user message and converts to async (with pattern)", async () => {
     __resetBgNotificationStateForTests();

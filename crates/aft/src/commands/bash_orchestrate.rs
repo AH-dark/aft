@@ -1589,6 +1589,7 @@ mod tests {
             live_descendants_summary: None,
             kill_signaled: false,
             kill_reached: 0,
+            remote_cancel: None,
             hard_kill: None,
             elapsed_ms: None,
             remote_job_id: None,

@@ -1301,6 +1301,9 @@ fn format_bash_kill(data: &Value) -> String {
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or("killed");
+    if let Some(cancel) = data.get("remote_cancel").and_then(Value::as_str) {
+        return format!("Task {task_id}: {status} · {cancel}");
+    }
     format!("Task {task_id}: {status}")
 }
 
@@ -5093,6 +5096,22 @@ mod bash_companion_format_tests {
             ),
             "Task bash-1: completed\nr"
         );
+    }
+
+    #[test]
+    fn bash_kill_unknown_outcome_reports_runner_answer() {
+        for cancel in [
+            "runner confirmed cancellation",
+            "runner reports job already ended",
+            "remote cancellation unconfirmed; outcome is still unknown: runner unavailable",
+        ] {
+            assert_eq!(
+                format_bash_kill(&json!({
+                    "task_id": "bash-unknown", "status": "fate_unknown", "remote_cancel": cancel,
+                })),
+                format!("Task bash-unknown: fate_unknown · {cancel}")
+            );
+        }
     }
 
     #[test]

@@ -527,6 +527,7 @@ interface BashKillDetails {
   status: string;
   kill_signaled?: boolean;
   kill_reached?: number;
+  remote_cancel?: string;
 }
 
 interface BashWatchDetails extends Record<string, unknown> {}
@@ -1378,7 +1379,8 @@ export function createBashKillTool(ctx: PluginContext) {
           details,
         );
       }
-      return bashKillResult(`Task ${params.task_id}: ${details.status}`, details);
+      const cancel = details.remote_cancel ? ` · ${details.remote_cancel}` : "";
+      return bashKillResult(`Task ${params.task_id}: ${details.status}${cancel}`, details);
     },
   };
 }

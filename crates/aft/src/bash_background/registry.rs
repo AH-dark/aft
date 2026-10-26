@@ -738,6 +738,9 @@ pub struct BgTaskSnapshot {
     pub kill_signaled: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub kill_reached: usize,
+    /// Result of probing cancellation of a finished task whose outcome is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_cancel: Option<String>,
     /// The task's own kill deadline, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_kill: Option<HardKillDeadline>,
@@ -6266,6 +6269,56 @@ impl BgTaskRegistry {
         project_root: Option<&Path>,
         harness: Option<&str>,
     ) -> Result<(), String> {
+        self.recover_task_if(
+            storage_dir,
+            session_id,
+            task_id,
+            project_root,
+            harness,
+            |_| true,
+        )
+    }
+
+    /// Restore an explicitly requested task before an owning session kills it.
+    /// Delivered terminals are omitted by project replay, but may still name
+    /// a runner job whose outcome is unknown.
+    pub(crate) fn recover_kill_task(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        task_id: &str,
+        project_root: &Path,
+        harness: Option<&str>,
+        scope: Option<&subc_protocol::scope::ScopeStamp>,
+    ) -> Result<(), String> {
+        self.recover_task_if(
+            storage_dir,
+            session_id,
+            task_id,
+            Some(project_root),
+            harness,
+            |metadata| match metadata.scope.as_ref() {
+                None => true,
+                // A newer epoch rebinds the same scope after a restart; it does
+                // not give another scope or an older binding control of the job.
+                Some(saved) => scope.is_some_and(|current| {
+                    current.owner == saved.owner
+                        && current.scope_ref == saved.scope_ref
+                        && current.scope_epoch >= saved.scope_epoch
+                }),
+            },
+        )
+    }
+
+    fn recover_task_if(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        task_id: &str,
+        project_root: Option<&Path>,
+        harness: Option<&str>,
+        accept: impl FnOnce(&PersistedTask) -> bool,
+    ) -> Result<(), String> {
         if validate_task_id(task_id).is_err() || self.task(task_id).is_some() {
             return Ok(());
         }
@@ -6287,6 +6340,7 @@ impl BgTaskRegistry {
                 metadata.project_root.as_deref().map(canonicalized_path)
                     != Some(canonicalized_path(project))
             })
+            || !accept(&metadata)
         {
             return Ok(());
         }
@@ -10603,7 +10657,14 @@ impl BgTaskRegistry {
                         && stamp.scope_epoch == scope.scope_epoch
                 });
             if let Some(stamp) = stamp {
-                if task.is_terminal() {
+                #[cfg(unix)]
+                let cancel_unknown = !paused
+                    && task.lock_state().is_ok_and(|state| {
+                        remote::unknown_remote_cancel_job(&state.metadata).is_some()
+                    });
+                #[cfg(not(unix))]
+                let cancel_unknown = false;
+                if task.is_terminal() && !cancel_unknown {
                     // A member the pause's own recorded intent already ended
                     // (its worker settled the pause first) was stopped by this
                     // pause, not finished before it.
@@ -10648,7 +10709,15 @@ impl BgTaskRegistry {
                             });
                         }
                     }
-                    Ok(_) => report.already_finished += 1,
+                    Ok(snapshot) => {
+                        if let Some(cancel) = snapshot.remote_cancel.as_deref() {
+                            crate::slog_info!(
+                                "scope-end remote cancel task={}: {cancel}",
+                                task.task_id
+                            );
+                        }
+                        report.already_finished += 1;
+                    }
                     Err(error) => errors.push(format!("{}: {error}", task.task_id)),
                 }
             }
@@ -14388,6 +14457,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
         live_descendants_summary,
         kill_signaled: false,
         kill_reached: 0,
+        remote_cancel: None,
         hard_kill,
         elapsed_ms: None,
         remote_job_id,
@@ -14575,6 +14645,7 @@ impl BgTask {
             live_descendants_summary: live_descendants_summary(metadata),
             kill_signaled: false,
             kill_reached: 0,
+            remote_cancel: None,
             hard_kill: if metadata.remote.is_none() {
                 HardKillDeadline::from_metadata(metadata.timeout_ms, self.hard_kill_renewable)
             } else {

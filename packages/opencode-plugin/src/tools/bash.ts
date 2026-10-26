@@ -897,6 +897,9 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
       if (data.kill_signaled === true) {
         return `Task ${args.taskId}: kill_signaled · reached ${String(data.kill_reached ?? 0)} live descendants`;
       }
+      if (typeof data.remote_cancel === "string") {
+        return `Task ${args.taskId}: ${String(data.status ?? "fate_unknown")} · ${data.remote_cancel}`;
+      }
       return `Task ${args.taskId}: ${String(data.status ?? "killed")}`;
     },
   };
