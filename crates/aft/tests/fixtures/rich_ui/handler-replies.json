@@ -59,7 +59,7 @@
     "exit_code": null,
     "output": "not forwarded",
     "waited": {
-      "reason": "match",
+      "reason": "matched",
       "limit_ms": 20000,
       "elapsed_ms": 1,
       "match": "private canary"

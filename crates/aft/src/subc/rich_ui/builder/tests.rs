@@ -872,3 +872,172 @@ fn output_cursor_contract_increments_on_no_progress_and_requires_task_binding() 
         }
     }
 }
+
+async fn real_watch_reply(
+    pattern: Option<&str>,
+    expired_budget: bool,
+) -> crate::protocol::Response {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use crate::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
+    use crate::bash_background::BgTaskStatus;
+    use crate::commands::blocking_wait::ReplyBudget;
+    use crate::config::Config;
+    use crate::context::AppContext;
+    use crate::harness::Harness;
+    use crate::protocol::RawRequest;
+    use crate::response_finalize::{DeferredResponseWake, DispatchOutcome};
+    use crate::sandbox_spawn::{
+        with_authenticated_principal, AuthenticatedPrincipal, PrincipalTrust,
+    };
+
+    const SESSION: &str = "rich-ui-watch-projection";
+    const TASK: &str = "bash-0123456789abcdef";
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        Config {
+            project_root: Some(project.path().into()),
+            storage_dir: Some(storage.path().into()),
+            harness: Some(Harness::Runner),
+            experimental_bash_background: true,
+            ..Config::default()
+        },
+    ));
+    let principal = AuthenticatedPrincipal::RouteBind {
+        trust: PrincipalTrust::FirstParty,
+        route_channel: 41,
+        route_epoch: 1,
+        project_root: project.path().into(),
+        harness: "runner".into(),
+        session_id: SESSION.into(),
+        principal_id: Some("reserved:broca".into()),
+    };
+    with_authenticated_principal(principal.clone(), || {
+        let storage = crate::bash_background::task_storage_dir(&ctx);
+        let resolved = create_task_layout(&storage, SESSION, TASK).unwrap();
+        let mut task = PersistedTask::starting(
+            TASK.into(),
+            SESSION.into(),
+            "printf ready".into(),
+            project.path().into(),
+            Some(project.path().into()),
+            None,
+            false,
+            false,
+        );
+        task.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task_at(&resolved, &task).unwrap();
+        std::fs::write(&resolved.paths.stdout, b"ready\n").unwrap();
+        std::fs::write(&resolved.paths.stderr, b"").unwrap();
+        std::fs::write(&resolved.paths.exit, b"0\n").unwrap();
+    });
+    let mut request: RawRequest = serde_json::from_value(json!({
+        "id":"watch-projection", "command":"bash_watch", "session_id":SESSION,
+        "task_id":TASK, "timeout_ms":1000,
+    }))
+    .unwrap();
+    if let Some(pattern) = pattern {
+        request.params["pattern"] = json!(pattern);
+    }
+    let now = Instant::now();
+    let budget = if expired_budget {
+        // An expired scan deadline produces a real timeout without a live child
+        // or a timing race. Its declared window remains positive for the schema.
+        ReplyBudget {
+            received_at: now - Duration::from_secs(1),
+            deadline: now - Duration::from_millis(1),
+        }
+    } else {
+        now.into()
+    };
+    let wake = DeferredResponseWake::default();
+    let producer_wake = wake.clone();
+    let producer_ctx = Arc::clone(&ctx);
+    let reply = tokio::time::timeout(Duration::from_secs(30), async {
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _wake = producer_wake.install();
+            with_authenticated_principal(principal, || {
+                crate::commands::bash_watch::handle_deferred_with_budget(
+                    &request,
+                    producer_ctx,
+                    budget,
+                )
+            })
+        })
+        .await
+        .unwrap();
+        match outcome {
+            DispatchOutcome::Immediate(response) => response,
+            DispatchOutcome::Deferred(mut pending) => {
+                wake.notified().await;
+                (pending.poll)(&ctx).expect("watch reply queued before wake")
+            }
+        }
+    })
+    .await
+    .expect("terminal watch must not wait for the watchdog");
+    assert!(reply.success, "{reply:?}");
+    reply
+}
+
+fn watch_operation() -> Value {
+    operations::operations()
+        .into_iter()
+        .find(|op| op["id"] == "bash_watch")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn watch_handler_matched_reason_projects_into_the_frozen_schema() {
+    let reply = real_watch_reply(Some("ready"), false).await;
+    assert_eq!(reply.data["waited"]["reason"], "matched");
+    let op = watch_operation();
+    let projected = operations::project_reply(&op, &reply.data);
+    schema::validate(&op["result"], &projected).unwrap();
+    assert_eq!(projected["waited"]["reason"], "match");
+}
+
+#[tokio::test]
+async fn watch_handler_exited_reason_projects_into_the_frozen_schema() {
+    let reply = real_watch_reply(None, false).await;
+    assert_eq!(reply.data["waited"]["reason"], "exited");
+    let op = watch_operation();
+    let projected = operations::project_reply(&op, &reply.data);
+    schema::validate(&op["result"], &projected).unwrap();
+    assert_eq!(projected["waited"]["reason"], "exit");
+}
+
+#[tokio::test]
+async fn watch_handler_timeout_reason_projects_into_the_frozen_schema() {
+    let reply = real_watch_reply(Some("not-present"), true).await;
+    assert_eq!(reply.data["waited"]["reason"], "timeout");
+    let op = watch_operation();
+    let projected = operations::project_reply(&op, &reply.data);
+    schema::validate(&op["result"], &projected).unwrap();
+    assert_eq!(projected["waited"]["reason"], "timeout");
+}
+
+#[tokio::test]
+async fn watch_handler_unknown_reason_is_refused_without_copying_it() {
+    let reply = real_watch_reply(None, false).await;
+    let op = watch_operation();
+    for unknown in [
+        json!("unknown-watch-reason-canary"),
+        json!("match"),
+        json!("exit"),
+        json!(null),
+        json!(17),
+    ] {
+        let mut source = reply.data.clone();
+        source["waited"]["reason"] = unknown;
+        let projected = operations::project_reply(&op, &source);
+        assert!(schema::validate(&op["result"], &projected).is_err());
+        assert!(projected.pointer("/waited/reason").is_none());
+        assert!(!projected
+            .to_string()
+            .contains("unknown-watch-reason-canary"));
+    }
+}

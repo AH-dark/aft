@@ -292,8 +292,20 @@ pub(crate) fn project_reply(operation: &Value, source: &Value) -> Value {
         if let Some(exit) = source.get("exit_code") {
             fields.insert("exitCode".into(), exit.clone());
         }
-        if let Some(waited) = source.get("waited") {
-            fields.insert("waited".into(), waited.clone());
+        if operation["id"] == "bash_watch" {
+            if let Some(waited) = source.get("waited") {
+                let reason = match waited.get("reason").and_then(Value::as_str) {
+                    Some("matched") => "match",
+                    Some("exited") => "exit",
+                    Some("timeout") => "timeout",
+                    // Leave an invalid candidate for result validation instead
+                    // of forwarding an unknown handler value or inventing one.
+                    _ => return Value::Null,
+                };
+                let mut waited = waited.clone();
+                waited["reason"] = json!(reason);
+                fields.insert("waited".into(), waited);
+            }
         }
         candidate = Value::Object(fields);
     }
