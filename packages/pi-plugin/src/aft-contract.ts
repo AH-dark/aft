@@ -37,7 +37,7 @@ import {
   callToolCallForSession,
   resolveSessionId,
 } from "./tools/_shared.js";
-import { resolvePathArg } from "./tools/hoisted.js";
+import { resolvePathArg, splitSearchPathArg } from "./tools/hoisted.js";
 import { asRecord, asString } from "./tools/render-helpers.js";
 import type { PluginContext } from "./types.js";
 
@@ -419,34 +419,46 @@ async function projectSafety(
 async function astScope(
   cwd: string,
   input: Record<string, unknown>,
-): Promise<{ paths: string[]; broad: boolean }> {
-  const rawPaths = Array.isArray(input.paths)
-    ? input.paths.filter((p): p is string => typeof p === "string")
-    : [];
-  const hasGlobs = Array.isArray(input.globs) && input.globs.length > 0;
+): Promise<{ paths: string[]; broad: boolean } | undefined> {
+  const rawPaths = coerceStringArray(input.paths);
   if (rawPaths.length === 0) return { paths: [cwd], broad: true };
-  const resolved = await resolveMany(cwd, rawPaths);
-  if (hasGlobs) return { paths: resolved, broad: true };
-  const dirFlags = await Promise.all(resolved.map(isDirectoryPath));
-  return { paths: resolved, broad: dirFlags.some(Boolean) };
+  const paths: string[] = [];
+  let broad = coerceStringArray(input.globs).length > 0;
+  for (const raw of rawPaths) {
+    const split = await splitSearchPathArg(cwd, raw);
+    if (split.missing.length > 0) return undefined;
+    for (const target of split.paths) {
+      const path = await resolveOne(cwd, target);
+      try {
+        // The engine requires every expanded root to exist; never admit a partial or fictitious scope.
+        const directory = (await stat(path)).isDirectory();
+        broad = broad || directory;
+      } catch {
+        return undefined;
+      }
+      paths.push(path);
+    }
+  }
+  return { paths, broad };
 }
 
 async function projectAstSearch(
   cwd: string,
   input: Record<string, unknown>,
 ): Promise<AftProjection> {
-  const { paths, broad } = await astScope(cwd, input);
-  return observation(paths, broad);
+  const scope = await astScope(cwd, input);
+  return scope ? observation(scope.paths, scope.broad) : UNKNOWN;
 }
 
 async function projectAstReplace(
   cwd: string,
   input: Record<string, unknown>,
 ): Promise<AftProjection> {
-  const { paths, broad } = await astScope(cwd, input);
-  // Dry-run previews without writing; the contract calls this out explicitly
-  // (AST dry-run versus apply) as an observation/mutation split on the same tool.
-  return coerceBoolean(input.dryRun) === true ? observation(paths, broad) : mutation(paths, broad);
+  const scope = await astScope(cwd, input);
+  if (!scope) return UNKNOWN;
+  return coerceBoolean(input.dryRun) === true
+    ? observation(scope.paths, scope.broad)
+    : mutation(scope.paths, scope.broad);
 }
 
 /**

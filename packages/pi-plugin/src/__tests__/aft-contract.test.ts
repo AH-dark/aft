@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -10,8 +10,16 @@ import { setHarnessOverrideForTesting } from "../harness.js";
 import type { OmpInternalUrlRouter } from "../omp-internal-urls.js";
 import { makeExtContext, makeMockBridge, makePluginContext } from "./tool-test-utils.js";
 
+const temporaryProjects: string[] = [];
+
+afterEach(() => {
+  for (const root of temporaryProjects.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
 function tmpProjectDir(): string {
-  return mkdtempSync(join(tmpdir(), "aft-contract-test-"));
+  const root = mkdtempSync(join(tmpdir(), "aft-contract-test-"));
+  temporaryProjects.push(root);
+  return root;
 }
 
 interface MockHostApi {
@@ -569,5 +577,55 @@ describe("session-owned mutation scope", () => {
     emitBus("aft:binding-request", { v: 1, sessionId: "session-1", requestId: "r1" });
     const projection = await response?.project("edit", { patch: "[a.ts#AAAA]\nREM\n" }, dir);
     expect(projection?.paths).toEqual([join(dir, "docs/adr/private.md")]);
+  });
+});
+
+describe("AST compound mutation scopes", () => {
+  test("whitespace scopes include every real root, including a protected directory", async () => {
+    const root = tmpProjectDir();
+    mkdirSync(join(root, "src"));
+    mkdirSync(join(root, "docs/adr"), { recursive: true });
+    const { bridge } = makeMockBridge();
+    const projected = await projectAftCall(
+      makePluginContext(bridge),
+      "ast_grep_replace",
+      { paths: ["src docs/adr"] },
+      root,
+    );
+    expect(projected).toEqual({
+      kind: "mutation",
+      paths: [join(root, "src"), join(root, "docs/adr")],
+      broad: true,
+    });
+  });
+
+  test("an existing literal path with spaces stays one scope even when its fragments exist", async () => {
+    const root = tmpProjectDir();
+    mkdirSync(join(root, "src"));
+    mkdirSync(join(root, "docs"));
+    mkdirSync(join(root, "src docs"));
+    const { bridge } = makeMockBridge();
+    const projected = await projectAftCall(
+      makePluginContext(bridge),
+      "ast_grep_replace",
+      { paths: ["src docs"] },
+      root,
+    );
+    expect(projected).toEqual({ kind: "mutation", paths: [join(root, "src docs")], broad: true });
+  });
+
+  test("partial and wholly missing compound roots are unknown, never partial safe scopes", async () => {
+    const root = tmpProjectDir();
+    mkdirSync(join(root, "src"));
+    const { bridge } = makeMockBridge();
+    for (const paths of [["src absent"], ["absent missing"], ["src", "absent missing"]]) {
+      const projected = await projectAftCall(
+        makePluginContext(bridge),
+        "ast_grep_replace",
+        { paths, globs: ["*.ts"] },
+        root,
+      );
+      expect(projected.kind).toBe("unknown");
+    }
   });
 });
