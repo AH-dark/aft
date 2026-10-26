@@ -851,10 +851,13 @@ mod tests {
             let retry = scan_with_project_root(command, project.path(), project.path());
             assert!(permissions_granted_cover(&retry, &grants),
                 "command={command}, grants={grants:?}, asks={retry:?}");
-            assert_eq!(retry.len(), 1, "{retry:?}");
-            assert_eq!(retry[0].kind, PermissionKind::Bash);
-            assert_eq!(retry[0].patterns, [command]);
-            assert!(retry[0].always.is_empty(), "unknown cwd must not offer a wildcard");
+            let exact = retry.iter().find(|ask| ask.reason.as_deref() == Some(crate::bash_permissions::scan::UNKNOWN_CWD_PERMISSION_REASON))
+                .expect("the unknown cwd requires exact-command approval");
+            assert_eq!(exact.kind, PermissionKind::Bash);
+            assert_eq!(exact.patterns, [command]);
+            assert!(exact.always.is_empty(), "unknown cwd must not offer a folder or reusable command grant");
+            assert!(!permissions_granted_cover(&retry, &[command.into()]),
+                "exact-command approval cannot replace individual command approvals");
             assert!(!permissions_granted_cover(&retry, &["build".into(), "rm *".into(), "*".into()]),
                 "relative paths and reusable commands cannot approve an unknown cwd");
         }

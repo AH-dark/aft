@@ -21,6 +21,25 @@ const SESSION: &str = "bash-grant-forgery";
 const COMMAND: &str = "touch forged-proof";
 
 #[test]
+fn bash_permissions_unknown_cwd_forwards_rm_rule_resource() {
+    let project = tempfile::tempdir().unwrap();
+    let command = "cd \"$DEST\" && rm -rf build";
+    let plan =
+        bash::prepare_bash_elicitation_plan(&json!({"command": command}), project.path()).unwrap();
+    let body = bash_elicitation_request_body(command, &plan.asks);
+    let asks = body["params"]["_meta"]["aft"]["asks"].as_array().unwrap();
+    assert!(
+        asks.iter().any(|ask| ask["kind"] == "bash"
+            && ask["patterns"] == json!(["rm -rf build"])
+            && ask["always"] == json!(["rm *"])),
+        "delegated consumers must receive the individual rm command resource: {asks:?}"
+    );
+    assert!(asks.iter().any(|ask| ask["patterns"] == json!([command])
+        && ask["reason"] == crate::bash_permissions::scan::UNKNOWN_CWD_PERMISSION_REASON));
+    assert_eq!(plan.grants, ["rm *", command]);
+}
+
+#[test]
 fn bash_permissions_unknown_cwd_reason_in_consent() {
     let project = tempfile::tempdir().unwrap();
     let command = "cd \"$DEST\" && shasum -c checksums";
@@ -32,9 +51,13 @@ fn bash_permissions_unknown_cwd_reason_in_consent() {
     let body = bash_elicitation_request_body(command, &asks);
     let reason = crate::bash_permissions::scan::UNKNOWN_CWD_PERMISSION_REASON;
     assert!(body["params"]["message"].as_str().unwrap().contains(reason));
-    assert_eq!(body["params"]["_meta"]["aft"]["asks"][0]["reason"], reason);
-    assert_eq!(asks[0].patterns, [command]);
-    assert!(asks[0].always.is_empty());
+    let forwarded = body["params"]["_meta"]["aft"]["asks"].as_array().unwrap();
+    let exact = forwarded
+        .iter()
+        .find(|ask| ask["reason"] == reason)
+        .unwrap();
+    assert_eq!(exact["patterns"], json!([command]));
+    assert_eq!(exact["always"], json!([]));
 }
 
 fn grant_test_context(root: &ProjectRootId, storage: &Path) -> Arc<AppContext> {

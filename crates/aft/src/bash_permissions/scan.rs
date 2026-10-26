@@ -238,8 +238,8 @@ fn scan_with_read_exemption(
 
     if unknown_cwd {
         // A relative folder approval has no stable identity after a dynamic cd.
-        // Bind approval to the whole command instead of offering a reusable grant.
-        asks.retain(|ask| ask.kind != PermissionKind::Bash);
+        // Add exact-command approval without replacing the individual command
+        // resources that the host checks against its allow and deny rules.
         asks.push(PermissionAsk {
             kind: PermissionKind::Bash,
             patterns: vec![command.to_string()],
@@ -1546,6 +1546,30 @@ mod tests {
     }
 
     #[test]
+    fn unknown_cwd_preserves_individual_command_permissions() {
+        let project = tempfile::tempdir().unwrap();
+        let command = "cd \"$DEST\" && rm -rf build";
+        let asks = scan_with_project_root(command, project.path(), project.path());
+        let rm = asks
+            .iter()
+            .find(|ask| ask.patterns == ["rm -rf build"])
+            .expect("the host must still evaluate rm command rules");
+        assert_eq!(rm.kind, PermissionKind::Bash);
+        assert_eq!(rm.always, ["rm *"]);
+        assert!(rm.reason.is_none());
+        let exact = asks
+            .iter()
+            .find(|ask| ask.reason.as_deref() == Some(UNKNOWN_CWD_PERMISSION_REASON))
+            .expect("the unknown directory still needs exact-command approval");
+        assert_eq!(exact.kind, PermissionKind::Bash);
+        assert_eq!(exact.patterns, [command]);
+        assert!(exact.always.is_empty());
+        assert!(asks
+            .iter()
+            .all(|ask| ask.kind != PermissionKind::ExternalDirectory));
+    }
+
+    #[test]
     fn relative_paths_after_an_unknown_directory_change_ask() {
         let project = tempfile::tempdir().unwrap();
         for command in [
@@ -1566,7 +1590,7 @@ mod tests {
         let asks = scan_with_project_root(command, project, project);
         let exact = asks
             .iter()
-            .find(|ask| ask.kind == PermissionKind::Bash)
+            .find(|ask| ask.reason.as_deref() == Some(UNKNOWN_CWD_PERMISSION_REASON))
             .unwrap();
         assert_eq!(exact.patterns, [command], "{command}");
         assert!(exact.always.is_empty(), "{command}");

@@ -183,6 +183,33 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(commands).not.toContain("bash_promote");
   }
 
+  skipOnWindows(
+    "unknown-cwd commands still obey the host rm deny rule",
+    async () => {
+      const { h, bash } = await pluginHarness({ bash_permissions: true });
+      await mkdir(join(h.tempDir, "build"));
+      const marker = join(h.tempDir, "build", "keep.txt");
+      await writeFile(marker, "must not delete");
+      const resources: string[] = [];
+      const ask: ToolContext["ask"] = async (input) => {
+        if (input.permission !== "bash") return;
+        resources.push(...input.patterns);
+        // Host policy: deny `rm *`, and allow every other command by default.
+        if (input.patterns.some((resource) => resource.startsWith("rm "))) {
+          throw new Error("rm denied by host rule");
+        }
+      };
+      await withEnv({ DEST: h.tempDir }, async () => {
+        await expect(
+          callPluginBash(bash, h, { command: 'cd "$DEST" && rm -rf build' }, { ask }),
+        ).rejects.toThrow("rm denied by host rule");
+      });
+      expect(resources).toContain("rm -rf build");
+      expect(await readFile(marker, "utf8")).toBe("must not delete");
+    },
+    E2E_TEST_TIMEOUT_MS,
+  );
+
   async function bridgeBashToTerminal(
     h: E2EHarness,
     args: Record<string, unknown>,
