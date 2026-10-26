@@ -82,6 +82,10 @@ pub fn is_project_env_trusted(storage_dir: Option<&Path>, project_root: &Path) -
 /// Everything here is bounded to small reads and `canonicalize`; no git process
 /// runs, so a bash call costs a few file reads.
 fn main_checkout_of(project_root: &Path) -> Option<PathBuf> {
+    // A project reached through a symlink is not the checkout it points at:
+    // its `.git` belongs to the target, so trusting the link would trust a
+    // folder the user never approved.
+    refuse_symlinks(project_root)?;
     let marker = project_root.join(".git");
     let pointer = read_bounded(&marker)?;
     let git_dir = resolve_pointer(project_root, pointer.trim().strip_prefix("gitdir:")?)?;
@@ -110,10 +114,26 @@ fn main_checkout_of(project_root: &Path) -> Option<PathBuf> {
         &entry,
         back_pointer.trim().trim_start_matches("gitdir:").trim(),
     )?;
-    if claimed.canonicalize().ok()? != marker.canonicalize().ok()? {
+    // The back-pointer names a checkout's `.git` marker: compare the folder
+    // that carries it with this project.
+    let claimed_root = claimed.parent()?.canonicalize().ok()?;
+    if claimed_root != project_root.canonicalize().ok()? {
         return None;
     }
+    // Each side must be this folder's own marker, not a link to another
+    // checkout's. The back-pointer can just as easily name a plain folder, so
+    // without this a folder whose `.git` links to a real worktree's marker
+    // would compare equal and inherit that checkout's trust.
+    refuse_symlinks(&marker)?;
+    refuse_symlinks(&claimed)?;
     Some(main.to_path_buf())
+}
+
+/// Refuse `path` when it is a symlink. Uses `symlink_metadata`, so the check
+/// never follows the link it is refusing.
+fn refuse_symlinks(path: &Path) -> Option<()> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    (!metadata.file_type().is_symlink()).then_some(())
 }
 
 /// Resolve a `gitdir:`/`gitdir` pointer target against the directory holding
@@ -594,6 +614,46 @@ mod tests {
         let other = tempdir().unwrap();
         trust_project(storage.path(), other.path()).unwrap();
         assert!(!is_project_env_trusted(Some(storage.path()), &worktree));
+    }
+
+    #[test]
+    fn a_marker_reached_through_a_symlink_is_refused_outright() {
+        // The attack: a folder whose `.git` is a symlink to a real linked
+        // worktree's `.git`. Reading through the link yields that worktree's
+        // pairing, so the check must refuse the linked marker itself rather
+        // than compare paths it derived through the link.
+        let (storage, _main, _parent, worktree) = trusted_checkout_with_worktree();
+        assert!(is_project_env_trusted(Some(storage.path()), &worktree));
+
+        let attacker = tempdir().unwrap();
+        let marker = attacker.path().join(".git");
+        std::os::unix::fs::symlink(worktree.join(".git"), &marker).unwrap();
+        assert!(
+            refuse_symlinks(&marker).is_none(),
+            "a symlinked marker must be refused by the marker check"
+        );
+        assert!(
+            main_checkout_of(attacker.path()).is_none(),
+            "a folder whose marker is a link has no checkout of its own"
+        );
+        assert!(
+            !is_project_env_trusted(Some(storage.path()), attacker.path()),
+            "a project whose `.git` is a symlink must not inherit trust"
+        );
+    }
+
+    #[test]
+    fn a_worktree_root_reached_through_a_symlink_is_refused() {
+        // The same trick one level up: the whole project path is a link to the
+        // real worktree, so its `.git` is reached through that link.
+        let (storage, _main, _parent, worktree) = trusted_checkout_with_worktree();
+        let holder = tempdir().unwrap();
+        let linked_root = holder.path().join("linked-root");
+        std::os::unix::fs::symlink(&worktree, &linked_root).unwrap();
+        assert!(
+            !is_project_env_trusted(Some(storage.path()), &linked_root),
+            "a worktree reached through a symlinked root must not inherit trust"
+        );
     }
 
     #[test]

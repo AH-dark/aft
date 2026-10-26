@@ -1955,21 +1955,22 @@ impl BgTaskRegistry {
         let linux_scope = env
             .remove("AFT_INTERNAL_LINUX_SCOPE")
             .is_some_and(|v| v == "1");
-        // Configured `bash.env` values apply to local commands only. Whatever
-        // the caller let through (`bash.runon_env`) is already unlisted, so
-        // every configured name is dropped here, with per-call `env` leaving
-        // through the child environment as before. `commands::bash_remote_env`
-        // owns the disclosure of what a job does not receive.
+        // Configured `bash.env` values apply to local commands only: the
+        // ambient environment must not carry one to a build server just
+        // because it happens to be exported here. The request's own map is a
+        // different thing -- it holds the per-call `env` values plus the user
+        // names `bash.runon_env` forwarded -- so it is layered on top and
+        // never filtered. `commands::bash_remote_env` owns the disclosure of
+        // what a job does not receive.
         let configured_env_names = launch.configured_env_names.clone();
         let shell_environment: crate::sandbox_spawn::ChildEnvironment =
             if !plan.is_native_launcher() && plan.host_shell_path().is_none() {
                 std::env::vars_os()
-                    .chain(
-                        env.clone()
-                            .into_iter()
-                            .filter(|(key, _)| !configured_env_names.iter().any(|name| name == key))
-                            .map(|(k, v)| (k.into(), v.into())),
-                    )
+                    .filter(|(key, _)| {
+                        !key.to_str()
+                            .is_some_and(|name| configured_env_names.iter().any(|n| n == name))
+                    })
+                    .chain(env.clone().into_iter().map(|(k, v)| (k.into(), v.into())))
                     .collect()
             } else {
                 crate::sandbox_spawn::approved_environment_for_plan(&plan, &env)

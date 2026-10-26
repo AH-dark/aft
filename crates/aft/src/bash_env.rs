@@ -126,6 +126,13 @@ pub(crate) const BLOCKED_ENV_PREFIXES: &[&str] = &[
     "SCCACHE_",
 ];
 
+/// The subset of [`BLOCKED_ENV_PREFIXES`] that belongs to AFT and its module
+/// transport. User configuration must not set these, but a per-call `env` may:
+/// the request is the agent's explicit choice for one command, and the product
+/// strips these names from the child environment anyway, so refusing them only
+/// breaks callers that pass them on purpose.
+const MODULE_CONTROL_PREFIXES: &[&str] = &["AFT_", "SUBC_", "CORTEXKIT_", "CORTEX_", "CK_"];
+
 /// Names refused at the project tier only. User configuration is the user's own
 /// file and may set them.
 pub(crate) const PROJECT_ONLY_BLOCKED_ENV_VARS: &[&str] = &[
@@ -189,6 +196,10 @@ fn matches_name(key: &str, name: &str) -> bool {
 }
 
 fn starts_with_prefix(key: &str, prefix: &str) -> bool {
+    // Compare bytes rather than slicing at a byte index: a configured name may
+    // be non-ASCII, and a cut inside a multi-byte character would panic.
+    let key = key.as_bytes();
+    let prefix = prefix.as_bytes();
     key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
@@ -236,9 +247,24 @@ pub(crate) fn first_refused_env_key(
         .map(String::as_str)
 }
 
+/// Whether `key` is refused on a per-call `env` map. This is the config rule
+/// minus the module-control prefixes: those names never reach a child (AFT
+/// strips them), and a call that passes one explicitly is asking for it.
+pub(crate) fn is_blocked_request_env_key(key: &str) -> bool {
+    if MODULE_CONTROL_PREFIXES
+        .iter()
+        .any(|prefix| starts_with_prefix(key, prefix))
+    {
+        return BLOCKED_ENV_VARS
+            .iter()
+            .any(|blocked| matches_name(key, blocked));
+    }
+    is_blocked_env_key(key)
+}
+
 pub(crate) fn first_blocked_env_key(env: &HashMap<String, String>) -> Option<&str> {
     env.keys()
-        .find(|key| is_blocked_env_key(key))
+        .find(|key| is_blocked_request_env_key(key))
         .map(String::as_str)
 }
 
@@ -309,6 +335,52 @@ mod tests {
             "home",
         ] {
             assert!(is_blocked_env_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_non_ascii_name_is_refused_instead_of_panicking() {
+        // A byte-index prefix check panics when it cuts inside a multi-byte
+        // character. Each name below starts with a refused prefix ("LD_",
+        // "AFT_", "SCCACHE_") and continues with one, so the check must reach
+        // a decision instead of slicing mid-character.
+        assert!(
+            is_blocked_env_key("LD_é"),
+            "LD_-prefixed name must be refused"
+        );
+        assert!(
+            is_blocked_env_key("AFT_é"),
+            "AFT_-prefixed name must be refused"
+        );
+        assert!(is_blocked_env_key("SCCACHE_日本"));
+        // A name sharing no refused prefix stays allowed.
+        assert!(!is_blocked_env_key("é"));
+        assert!(!is_blocked_env_key("IBToolNeverDequeé"));
+        assert!(!is_project_blocked_env_key("é"));
+    }
+
+    #[test]
+    fn module_control_names_are_refused_in_config_and_allowed_per_call() {
+        // Configuration must never set these, but a call may pass one: AFT
+        // strips them from the child anyway, and refusing them only breaks a
+        // caller that asks for them explicitly.
+        for key in ["AFT_INTERNAL_LINUX_SCOPE", "SUBC_MODULE_ID", "CORTEX_X"] {
+            let request_env = std::collections::HashMap::from([(key.to_string(), "1".to_string())]);
+            assert!(
+                first_blocked_env_key(&request_env).is_none(),
+                "{key} must be allowed on a per-call env"
+            );
+            let config_env = std::collections::BTreeMap::from([(key.to_string(), "1".to_string())]);
+            assert_eq!(
+                first_refused_env_key(&config_env, BashEnvTier::User),
+                Some(key),
+                "{key} must still be refused in configuration"
+            );
+        }
+        // Names outside the module prefixes keep the full per-call rule.
+        for key in ["PATH", "GIT_CONFIG_COUNT", "NODE_OPTIONS", "LD_PRELOAD"] {
+            let request_env = std::collections::HashMap::from([(key.to_string(), "1".to_string())]);
+            assert_eq!(first_blocked_env_key(&request_env), Some(key), "{key}");
         }
     }
 

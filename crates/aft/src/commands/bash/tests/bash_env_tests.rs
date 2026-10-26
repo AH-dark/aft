@@ -232,11 +232,11 @@ fn a_refused_per_call_name_is_rejected_before_the_launch() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let ctx = context(project.path(), storage.path());
-    for name in [
-        "AFT_INTERNAL_LINUX_SCOPE",
-        "GIT_CONFIG_COUNT",
-        "NODE_OPTIONS",
-    ] {
+    // Module-control names (`AFT_*`, `SUBC_*`) are allowed per call: the
+    // product strips them from the child, so refusing them only breaks callers
+    // that pass them on purpose. Everything else stays refused, including a
+    // non-ASCII name, which must be refused rather than panic on a byte cut.
+    for name in ["GIT_CONFIG_COUNT", "NODE_OPTIONS", "PATH"] {
         let mut request = request("refused", "printf hi");
         request.params["params"]["env"] = json!({ name: "1" });
         let response = handle(&request, &ctx);
