@@ -958,6 +958,7 @@ pub(super) fn prepare_bash_elicitation_plan(
             kind: crate::bash_permissions::PermissionKind::Bash,
             patterns: vec![command.clone()],
             always: Vec::new(),
+            reason: None,
             targets: Vec::new(),
         }]
     } else {

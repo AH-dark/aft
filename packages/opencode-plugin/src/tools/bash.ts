@@ -2,10 +2,13 @@ import {
   BASH_HOST_FALLBACK_REFUSAL,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
+  type BashPermissionAsk,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
   coerceBoolean,
+  escalationAskText,
+  groupBashPermissionAsks,
   isLiveBackgroundTaskReply,
   LONGEST_TIMER_DELAY_MS,
   maybeAppendGrepSearchHint,
@@ -15,6 +18,7 @@ import {
   sleep,
   type WatchCallerRole,
   WORKER_WAIT_LIMIT_PHRASE,
+  withBashPermissionLoop,
   workerBackgroundTaskNote,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
@@ -311,55 +315,7 @@ export function bashToolDescription(
 DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`;
 }
 
-interface PermissionAsk {
-  kind: "external_directory" | "bash" | "escalation";
-  patterns?: string[];
-  always?: string[];
-  command?: string;
-  cwd?: string;
-  grant_id?: string;
-}
-
 type BridgeCaller = typeof callBashBridge;
-
-function pushUnique(target: string[], values: string[]): void {
-  for (const value of values) {
-    if (!target.includes(value)) target.push(value);
-  }
-}
-
-function groupBashPermissionAsks(asks: PermissionAsk[]): PermissionAsk[] {
-  const grouped: PermissionAsk[] = [];
-  let bashAsk: PermissionAsk | undefined;
-
-  for (const ask of asks) {
-    if (ask.kind === "bash") {
-      if (!bashAsk) {
-        bashAsk = { kind: "bash", patterns: [], always: [] };
-        grouped.push(bashAsk);
-      }
-      pushUnique(bashAsk.patterns ?? [], ask.patterns ?? []);
-      pushUnique(bashAsk.always ?? [], ask.always ?? []);
-      continue;
-    }
-
-    grouped.push(ask);
-  }
-
-  return grouped;
-}
-
-function permissionsGrantedForRetry(asks: PermissionAsk[]): string[] {
-  return asks.flatMap((ask) => {
-    if (ask.kind === "escalation") return ask.grant_id ? [ask.grant_id] : [];
-    const always = ask.always ?? [];
-    return always.length > 0 ? always : (ask.patterns ?? []);
-  });
-}
-
-function escalationAskText(ask: PermissionAsk): string {
-  return `This command will run UNSANDBOXED on the host.\n\nExact command:\n${ask.command ?? ""}\n\nWorking directory:\n${ask.cwd ?? ""}`;
-}
 
 async function withPermissionLoop(
   ctx: PluginContext,
@@ -368,53 +324,33 @@ async function withPermissionLoop(
   bridgeCall: BridgeCaller,
   options?: BridgeRequestOptions,
 ): ReturnType<BridgeCaller> {
-  const granted: string[] = [];
-  let response = await bridgeCall(
-    ctx,
-    runtime,
-    "bash",
-    withHostPermissionGrants(params, granted),
-    options,
-  );
-
-  for (let round = 0; round < 8; round++) {
-    if (response.success !== false || response.code !== "permission_required") return response;
-    const asks = Array.isArray(response.asks) ? (response.asks as PermissionAsk[]) : [];
-    if (asks.length === 0) throw new Error("bash permission retry failed: no asks returned");
-
-    for (const ask of groupBashPermissionAsks(asks)) {
-      const permission = ask.kind === "external_directory" ? "external_directory" : "bash";
-      const escalation = ask.kind === "escalation";
-      await runAsk(
-        runtime.ask({
-          permission,
-          patterns: escalation ? [escalationAskText(ask)] : (ask.patterns ?? []),
-          always: escalation ? [] : (ask.always ?? []),
-          metadata: escalation
-            ? {
-                command: ask.command ?? "",
-                cwd: ask.cwd ?? "",
-                grant_id: ask.grant_id ?? "",
-                unsandboxed: true,
-              }
-            : {},
-        }),
-      );
-    }
-
-    for (const grant of permissionsGrantedForRetry(asks)) {
-      if (!granted.includes(grant)) granted.push(grant);
-    }
-    response = await bridgeCall(
-      ctx,
-      runtime,
-      "bash",
-      withHostPermissionGrants(params, granted),
-      options,
-    );
-  }
-
-  throw new Error("bash permission retry failed: too many rounds");
+  return withBashPermissionLoop({
+    request: (granted) =>
+      bridgeCall(ctx, runtime, "bash", withHostPermissionGrants(params, granted), options),
+    approve: async (asks: readonly BashPermissionAsk[]) => {
+      for (const ask of groupBashPermissionAsks(asks)) {
+        const permission = ask.kind === "external_directory" ? "external_directory" : "bash";
+        const escalation = ask.kind === "escalation";
+        await runAsk(
+          runtime.ask({
+            permission,
+            patterns: escalation ? [escalationAskText(ask)] : (ask.patterns ?? []),
+            always: escalation ? [] : (ask.always ?? []),
+            metadata: escalation
+              ? {
+                  command: ask.command ?? "",
+                  cwd: ask.cwd ?? "",
+                  grant_id: ask.grant_id ?? "",
+                  unsandboxed: true,
+                }
+              : ask.reason
+                ? { reason: ask.reason }
+                : {},
+          }),
+        );
+      }
+    },
+  });
 }
 
 /** The PTY argument's sentence on driving a session, naming only registered companions. */

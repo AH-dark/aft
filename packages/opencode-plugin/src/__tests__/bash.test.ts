@@ -541,6 +541,43 @@ describe("OpenCode bash adapter", () => {
     expect(calls[1].params.permissions_granted).toEqual(["rm *", "/tmp/*"]);
   });
 
+  test("permission loop stops early and names an already granted ask", async () => {
+    const ask = mockAsk();
+    const { calls, tool: bash } = createHarness(() => ({
+      success: false,
+      code: "permission_required",
+      asks: [{ kind: "bash", patterns: ["rsync -a source/ worker/"], always: ["rsync *"] }],
+    }));
+    await expect(
+      bash.execute({ command: "rsync -a source/ worker/" }, createMockSdkContext({ ask })),
+    ).rejects.toThrow("bash rsync -a source/ worker/ (operation: bash; granted already: yes)");
+    expect(calls).toHaveLength(2);
+    expect(ask).toHaveBeenCalledTimes(1);
+  });
+
+  test("unknown cwd approval keeps the exact command and reason", async () => {
+    const ask = mockAsk();
+    const command = 'cd "$DEST" && cat checksums';
+    const reason = "Working directory is unknown; approve this exact command.";
+    const { calls, tool: bash } = createHarness((_command, params) =>
+      params.permissions_granted?.length
+        ? { success: true, output: "ok" }
+        : {
+            success: false,
+            code: "permission_required",
+            asks: [{ kind: "bash", patterns: [command], always: [], reason }],
+          },
+    );
+    await bash.execute({ command }, createMockSdkContext({ ask }));
+    expect(ask.mock.calls[0][0]).toEqual({
+      permission: "bash",
+      patterns: [command],
+      always: [],
+      metadata: { reason },
+    });
+    expect(calls[1].params.permissions_granted).toEqual([command]);
+  });
+
   test("host escalation ask shows exact payload and retries with opaque grant", async () => {
     const ask = mockAsk();
     let sendCount = 0;

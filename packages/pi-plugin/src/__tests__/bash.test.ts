@@ -1737,6 +1737,55 @@ describe("bash tool adapter", () => {
     });
   });
 
+  test("permission loop stops early and names an already granted ask", async () => {
+    const tools = new Map<string, MockToolDef>();
+    let calls = 0;
+    let approvals = 0;
+    const bridge = {
+      send: async () => {
+        calls++;
+        return {
+          success: false,
+          code: "permission_required",
+          asks: [
+            {
+              kind: "escalation",
+              command: "rsync -a source/ worker/",
+              cwd: projectRoot,
+              grant_id: "esc_repeat",
+            },
+          ],
+        };
+      },
+    } as unknown as BinaryBridge;
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const extCtx: MockExtensionContext = {
+      cwd: projectRoot,
+      hasUI: true,
+      ui: {
+        confirm: async () => {
+          approvals++;
+          return true;
+        },
+      },
+    };
+    await expect(
+      tools
+        .get("bash")!
+        .execute(
+          "repeat",
+          { command: "rsync -a source/ worker/", sandbox: "host" },
+          undefined,
+          undefined,
+          extCtx,
+        ),
+    ).rejects.toThrow(
+      `escalation rsync -a source/ worker/ @ ${projectRoot} (operation: bash; granted already: yes)`,
+    );
+    expect(calls).toBe(2);
+    expect(approvals).toBe(1);
+  });
+
   test("permission_required error throws clear message", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
