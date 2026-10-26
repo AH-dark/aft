@@ -1546,6 +1546,31 @@ mod tests {
     }
 
     #[test]
+    fn quoted_heredoc_body_is_not_scanned_as_commands_or_paths() {
+        let scratch = std::env::current_dir().unwrap().join("target/bash-heredoc");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let project = fixture.path().join("project");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(project.join("gate.sh"), "").unwrap();
+        let command = format!(
+            "cat > '{}/gate.sh' <<'EOF'\ncp '{}/body-only.txt' /tmp/copy\nsed -n '1p' '{}/body-only.txt'\npython3 - <<'PY'\nprint('$(body_only_command /tmp/data)')\nPY\necho \"$HOME $(body_only_command '{}/body-only.txt')\"\nEOF\n",
+            project.display(), outside.display(), outside.display(), outside.display(),
+        );
+        let asks = scan_with_project_root(&command, &project, &outside);
+        assert_eq!(
+            asks.len(),
+            1,
+            "only the outer cat command may ask: {asks:?}"
+        );
+        assert_eq!(asks[0].kind, PermissionKind::Bash);
+        assert_eq!(asks[0].always, ["cat *"]);
+        assert!(asks[0].patterns[0].starts_with("cat > "));
+    }
+
+    #[test]
     fn unknown_cwd_preserves_individual_command_permissions() {
         let project = tempfile::tempdir().unwrap();
         let command = "cd \"$DEST\" && rm -rf build";

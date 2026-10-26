@@ -1056,6 +1056,248 @@ mod tests {
         }
     }
 
+    fn assert_bash_permission_roundtrip(
+        command: &str,
+        project: &Path,
+    ) -> Vec<crate::bash_permissions::PermissionAsk> {
+        let first =
+            crate::bash_permissions::scan::scan_with_project_root(command, project, project);
+        assert!(!first.is_empty(), "the command must actually be scanned");
+        for prefer_always in [false, true] {
+            let mut grants = Vec::new();
+            let mut retry = first.clone();
+            let mut rounds = 0;
+            while !permissions_granted_cover(&retry, &grants) {
+                assert!(
+                    rounds < 2,
+                    "permission retry did not settle: {retry:?}; grants={grants:?}"
+                );
+                for ask in &retry {
+                    let approved = if prefer_always && !ask.always.is_empty() {
+                        &ask.always
+                    } else {
+                        &ask.patterns
+                    };
+                    for grant in approved {
+                        if !grants.contains(grant) {
+                            grants.push(grant.clone());
+                        }
+                    }
+                }
+                rounds += 1;
+                retry = crate::bash_permissions::scan::scan_with_project_root(
+                    command, project, project,
+                );
+            }
+            assert_eq!(rounds, 1, "the granted set must cover the first retry");
+        }
+        first
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_permissions_roundtrip_alf_quoted_gate() {
+        use crate::bash_permissions::PermissionKind;
+        const CHILD_HOME: &str = "AFT_ALF_PERMISSION_TEST_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            assert_eq!(std::env::var_os("HOME"), Some(home.clone()));
+            let project = PathBuf::from(home).join("fixture-project");
+            let command = include_str!("../../tests/fixtures/bash_permissions/alf_quoted_gate.sh");
+            let asks = assert_bash_permission_roundtrip(command, &project);
+            assert!(
+                asks.iter().all(|ask| ask.kind == PermissionKind::Bash),
+                "{asks:?}"
+            );
+            assert_eq!(
+                asks.iter().filter(|ask| ask.reason.is_none()).count(),
+                8,
+                "heredoc commands must remain data: {asks:?}"
+            );
+            for resource in [
+                "set -e",
+                "git worktree add -q --detach $S/fixture-s14 HEAD",
+                "git log --oneline -1",
+                "chmod +x .gate-s14.sh",
+                "chmod +x /tmp/run-s14.sh",
+                "grep -n '^run \\|^wait\\|nats' /tmp/run-s14.sh",
+            ] {
+                assert!(
+                    asks.iter()
+                        .any(|ask| ask.patterns == [resource] && ask.reason.is_none()),
+                    "outer command missing: {resource}; asks={asks:?}"
+                );
+            }
+            assert!(
+                asks.iter().any(|ask| ask.reason.is_none()
+                    && (ask.patterns[0] == "cat" || ask.patterns[0].starts_with("cat "))
+                    && ask.always == ["cat *"]),
+                "outer cat resource missing: {asks:?}"
+            );
+            assert!(
+                asks.iter().any(|ask| ask.patterns[0]
+                    .starts_with("sed -e '/^run fixture-lanes-s2/d'")
+                    && ask.always == ["sed *"]),
+                "outer sed resource missing: {asks:?}"
+            );
+            assert!(asks.iter().any(|ask| ask.patterns == [command]
+                && ask.always.is_empty()
+                && ask.reason.as_deref()
+                    == Some(crate::bash_permissions::scan::UNKNOWN_CWD_PERMISSION_REASON)));
+            return;
+        }
+
+        // HOME belongs to the child only, so parallel tests cannot observe the
+        // fixture's tilde expansion instead of their own environment.
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let home = fixture.path().join("home");
+        std::fs::create_dir_all(home.join("fixture-project")).unwrap();
+        std::fs::create_dir_all(home.join("fixture-scratch")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::bash::tests::bash_permissions_roundtrip_alf_quoted_gate",
+                "--nocapture",
+            ])
+            .env(CHILD_HOME, &home)
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the isolated child must run its test: {stdout}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_permissions_roundtrip_unix_temp_aliases() {
+        use crate::bash_permissions::{is_system_temp_path, PermissionKind};
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixture = tempfile::tempdir_in(scratch).unwrap();
+        let project = fixture.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::write(temp.path().join("existing.txt"), "fixture").unwrap();
+        let canonical = std::fs::canonicalize(temp.path()).unwrap();
+        let alias = fixture.path().join("tmp-alias");
+        std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+        assert!(!alias.starts_with(&project));
+        assert_eq!(std::fs::canonicalize(&alias).unwrap(), canonical);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            std::fs::canonicalize("/tmp").unwrap(),
+            PathBuf::from("/private/tmp")
+        );
+        let private_alias = Path::new("/private/tmp").join(temp.path().file_name().unwrap());
+        for directory in [
+            temp.path(),
+            canonical.as_path(),
+            alias.as_path(),
+            private_alias.as_path(),
+        ] {
+            for tail in ["existing.txt", "missing/deep/file.txt"] {
+                let path = directory.join(tail);
+                assert!(
+                    is_system_temp_path(&path),
+                    "temporary alias must be recognized: {path:?}"
+                );
+                let command = format!("chmod +x '{}' && cat '{}'", path.display(), path.display());
+                let asks = assert_bash_permission_roundtrip(&command, &project);
+                assert!(
+                    asks.iter().all(|ask| ask.kind == PermissionKind::Bash),
+                    "temp paths must not create external asks: {asks:?}"
+                );
+            }
+        }
+        let ordinary = fixture.path().join("not-system-temp/file.txt");
+        assert!(!is_system_temp_path(&ordinary));
+        let asks = crate::bash_permissions::scan::scan_with_project_root(
+            &format!("cat '{}'", ordinary.display()),
+            &project,
+            &project,
+        );
+        assert!(asks
+            .iter()
+            .any(|ask| ask.kind == PermissionKind::ExternalDirectory));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bash_permissions_roundtrip_windows_temp_short_and_long() {
+        use crate::bash_permissions::{is_system_temp_path, PermissionKind};
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let temp = tempfile::Builder::new()
+            .prefix("aft permission temp long name ")
+            .tempdir()
+            .unwrap();
+        let long = crate::windows_path::normalize_windows_path(
+            &std::fs::canonicalize(temp.path()).unwrap(),
+        );
+        let input: Vec<u16> = long.as_os_str().encode_wide().chain(Some(0)).collect();
+        let size = unsafe { GetShortPathNameW(input.as_ptr(), std::ptr::null_mut(), 0) };
+        assert_ne!(
+            size,
+            0,
+            "GetShortPathNameW: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut output = vec![0; size as usize];
+        let written = unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), size) };
+        assert!(written > 0 && written < size);
+        let short = PathBuf::from(std::ffi::OsString::from_wide(&output[..written as usize]));
+        if short
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&long.to_string_lossy())
+        {
+            assert!(
+                std::env::var_os("AFT_TEST_REQUIRE_WINDOWS_SHORT_PATH").is_none(),
+                "Windows temp volume did not provide an 8.3 alias"
+            );
+            eprintln!("skipped: the temp volume does not create 8.3 short names");
+            return;
+        }
+        assert_eq!(
+            crate::windows_path::normalize_windows_path(&std::fs::canonicalize(&short).unwrap()),
+            long
+        );
+        std::fs::write(long.join("existing.txt"), "fixture").unwrap();
+        let scratch = std::env::current_dir()
+            .unwrap()
+            .join("target/bash-roundtrip");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let project = tempfile::tempdir_in(scratch).unwrap();
+        for directory in [&short, &long] {
+            for tail in ["existing.txt", "missing/deep/file.txt"] {
+                let path = directory.join(tail);
+                assert!(
+                    is_system_temp_path(&path),
+                    "temporary alias must be recognized: {path:?}"
+                );
+                let command = format!("chmod +x '{}' && cat '{}'", path.display(), path.display());
+                let asks = assert_bash_permission_roundtrip(&command, project.path());
+                assert!(
+                    asks.iter().all(|ask| ask.kind == PermissionKind::Bash),
+                    "temp paths must not create external asks: {asks:?}"
+                );
+            }
+        }
+        println!("Windows temp aliases exercised: {short:?} == {long:?}");
+    }
+
     #[test]
     fn external_approval_coverage_respects_path_and_kind() {
         use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
