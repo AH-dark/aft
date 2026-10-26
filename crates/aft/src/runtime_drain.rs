@@ -6425,17 +6425,40 @@ mod tests {
         drain_callgraph_store_events(&ctx);
         assert!(ctx.callgraph_store_rx().lock().is_some());
         blocker.execute_batch("ROLLBACK").unwrap();
+        let crate::callgraph_store::RefreshOpenLockTestGate {
+            held: refresh_locked,
+            release: release_refresh,
+            unlocked: refresh_unlocked,
+            read_done,
+        } = crate::callgraph_store::hold_refresh_open_lock_for_test(
+            ctx.callgraph_project_root().unwrap(),
+        );
         drain_callgraph_store_events(&ctx);
         assert!(ctx.callgraph_store_rx().lock().is_none());
         assert!(ctx.callgraph_store().read().unwrap().is_some());
         assert_eq!(ctx.pending_callgraph_store_force_token(), None);
-        let resident = ctx.callgraph_store().read().unwrap();
-        let tree = resident
-            .as_ref()
-            .unwrap()
-            .call_tree(Path::new("main.rs"), "entry", 1)
+        refresh_locked
+            .recv_timeout(Duration::from_secs(10))
             .unwrap();
+        let resident = ctx.callgraph_store().read().unwrap();
+        let store = resident.as_ref().unwrap();
+        // Only SQLite observing the held lock can release the writer. The
+        // callback waits for ROLLBACK before allowing the query to retry, so a
+        // delayed test thread cannot miss contention and pass without a wait.
+        let (tree, busy_observed) = store.with_busy_observer_for_test(
+            move |timeout| {
+                release_refresh.send(()).is_ok() && refresh_unlocked.recv_timeout(timeout).is_ok()
+            },
+            || store.call_tree(Path::new("main.rs"), "entry", 1),
+        );
+        // Dropping the endpoint also frees the worker on an error or panic.
+        drop(read_done);
+        let tree = tree.unwrap();
+        assert!(busy_observed, "SQLite must observe the refresh lock");
         assert_eq!(tree.children[0].name, "leaf");
+        crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(
+            &ctx.callgraph_project_root().unwrap(),
+        );
     }
 
     #[test]
